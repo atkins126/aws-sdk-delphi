@@ -21,7 +21,10 @@ uses
   AWSTests.Cases.Utils in 'Source\Common\AWSTests.Cases.Utils.pas',
   AWSTests.SQS in 'Source\AWSTests.SQS.pas',
   AWSTests.TestBase in 'Source\AWSTests.TestBase.pas',
-  AWSTests.SES in 'Source\AWSTests.SES.pas';
+  AWSTests.SES in 'Source\AWSTests.SES.pas',
+  AWSTests.SNS in 'Source\AWSTests.SNS.pas',
+  AWSTests.Utils in 'Source\AWSTests.Utils.pas',
+  AWSTests.Polly in 'Source\AWSTests.Polly.pas';
 
 {$R *.RES}
 

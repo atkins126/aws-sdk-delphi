@@ -4,6 +4,7 @@ interface
 
 uses
   System.Generics.Collections, System.Generics.Defaults, System.Classes, System.SysUtils,
+  AWS.Internal.Auth.AWS4SignerHelper,
   AWS.Internal.Request,
   AWS.Internal.ParameterCollection,
   AWS.Internal.ParameterDictionary,
@@ -25,6 +26,7 @@ type
     FOriginalRequest: TAmazonWebServiceRequest;
     FContent: TArray<Byte>;
     FContentStream: TStream;
+    FIsSetContent: Boolean;
     FOwnsContentStream: Boolean;
     FHttpMethod: string;
     FUseQueryString: Boolean;
@@ -43,7 +45,10 @@ type
     FUseChunkEncoding: Boolean;
     FContentStreamHash: string;
     FSuppress404Exceptions: Boolean;
+    FAWS4SignerResult: TAWS4SigningResult;
     FOriginalStreamPosition: Int64;
+    FCanonicalResourcePrefix: string;
+    FHostPrefix: string;
   strict private
     function GetRequestName: string;
     function GetServiceName: string;
@@ -89,9 +94,14 @@ type
     procedure SetUseChunkEncoding(const Value: Boolean);
     function GetOriginalStreamPosition: Int64;
     procedure SetOriginalStreamPosition(const Value: Int64);
-  private
     function GetSuppress404Exceptions: Boolean;
     procedure SetSuppress404Exceptions(const Value: Boolean);
+    function GetAWS4SignerResult: TAWS4SigningResult;
+    procedure SetAWS4SignerResult(const Value: TAWS4SigningResult);
+    function GetCanonicalResourcePrefix: string;
+    procedure SetCanonicalResourcePrefix(const Value: string);
+    function GetHostPrefix: string;
+    procedure SetHostPrefix(const Value: string);
   public
     constructor Create(ARequest: TAmazonWebServiceRequest; AServiceName: string); reintroduce;
     destructor Destroy; override;
@@ -99,6 +109,9 @@ type
     function HasRequestBody: Boolean;
     function HasRequestData: Boolean;
     function ComputeContentStreamHash: string;
+    function IsRequestStreamRewindable: Boolean;
+    function IsSetContent: Boolean;
+
     procedure AddSubResource(const ASubResource: string; const AValue: string = '');
     procedure AddPathResource(const AKey, AValue: string);
     function GetHeaderValue(const AHeaderName: string): string;
@@ -126,7 +139,10 @@ type
     property AuthenticationRegion: string read GetAuthenticationRegion write SetAuthenticationRegion;
     property UseChunkEncoding: Boolean read GetUseChunkEncoding write SetUseChunkEncoding;
     property Suppress404Exceptions: Boolean read GetSuppress404Exceptions write SetSuppress404Exceptions;
+    property AWS4SignerResult: TAWS4SigningResult read GetAWS4SignerResult write SetAWS4SignerResult;
     property OriginalStreamPosition: Int64 read GetOriginalStreamPosition write SetOriginalStreamPosition;
+    property CanonicalResourcePrefix: string read GetCanonicalResourcePrefix write SetCanonicalResourcePrefix;
+    property HostPrefix: string read GetHostPrefix write SetHostPrefix;
   end;
 
 implementation
@@ -191,7 +207,7 @@ begin
   FServiceName := AServiceName;
   FOriginalRequest := ARequest;
   FRequestName := Copy(FOriginalRequest.ClassName, 2);
-  FOwnsContentStream := True;
+//  FOwnsContentStream := True;
   UseSigV4 := ARequest.UseSigV4;
 
   FParametersCollection := TParameterCollection.Create;
@@ -205,6 +221,7 @@ begin
   FPathResources.Free;
   FParametersCollection.Free;
   ContentStream := nil;
+  AWS4SignerResult := nil;
   inherited;
 end;
 
@@ -218,9 +235,19 @@ begin
   Result := FAuthenticationRegion;
 end;
 
+function TDefaultRequest.GetAWS4SignerResult: TAWS4SigningResult;
+begin
+  Result := FAWS4SignerResult;
+end;
+
 function TDefaultRequest.GetCanonicalResource: string;
 begin
   Result := FCanonicalResource;
+end;
+
+function TDefaultRequest.GetCanonicalResourcePrefix: string;
+begin
+  Result := FCanonicalResourcePrefix;
 end;
 
 function TDefaultRequest.GetContent: TArray<Byte>;
@@ -257,6 +284,11 @@ function TDefaultRequest.GetHeaderValue(const AHeaderName: string): string;
 begin
   if not Headers.TryGetValue(AHeaderName, Result) then
     Result := '';
+end;
+
+function TDefaultRequest.GetHostPrefix: string;
+begin
+  Result := FHostPrefix;
 end;
 
 function TDefaultRequest.GetHttpMethod: string;
@@ -359,10 +391,32 @@ end;
 
 function TDefaultRequest.HasRequestData: Boolean;
 begin
-  if (ContentStream <> nil) or (Length(Content) > 0) then
+  if (ContentStream <> nil) or IsSetContent then
     Result := True
   else
     Result := Parameters.Count > 0;
+end;
+
+function TDefaultRequest.IsRequestStreamRewindable: Boolean;
+begin
+  var stream := ContentStream;
+
+  // Retries may not be possible with a stream
+  if stream <> nil then
+  begin
+    // Pull out the underlying non-wrapper stream
+    stream := TWrapperStream.GetNonWrapperBaseStream(stream);
+
+    // Retry is possible if stream is seekable
+    Exit(CanSeek(stream));
+  end;
+
+  Result := True;
+end;
+
+function TDefaultRequest.IsSetContent: Boolean;
+begin
+  Result := FIsSetContent;
 end;
 
 function TDefaultRequest.MayContainRequestBody: Boolean;
@@ -380,14 +434,29 @@ begin
   FAuthenticationRegion := Value;
 end;
 
+procedure TDefaultRequest.SetAWS4SignerResult(const Value: TAWS4SigningResult);
+begin
+  if FAWS4SignerResult <> Value then
+  begin
+    FAWS4SignerResult.Free;
+    FAWS4SignerResult := Value;
+  end;
+end;
+
 procedure TDefaultRequest.SetCanonicalResource(const Value: string);
 begin
   FCanonicalResource := Value;
 end;
 
+procedure TDefaultRequest.SetCanonicalResourcePrefix(const Value: string);
+begin
+  FCanonicalResourcePrefix := Value;
+end;
+
 procedure TDefaultRequest.SetContent(const Value: TArray<Byte>);
 begin
   FContent := Value;
+  FIsSetContent := True;
 end;
 
 procedure TDefaultRequest.SetContentStream(const Value: TStream);
@@ -422,6 +491,11 @@ end;
 procedure TDefaultRequest.SetEndpoint(const Value: IUri);
 begin
   FEndpoint := Value;
+end;
+
+procedure TDefaultRequest.SetHostPrefix(const Value: string);
+begin
+  FHostPrefix := Value;
 end;
 
 procedure TDefaultRequest.SetHttpMethod(const Value: string);

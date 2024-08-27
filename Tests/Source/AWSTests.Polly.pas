@@ -3,21 +3,21 @@ unit AWSTests.Polly;
 interface
 
 uses
-  System.SysUtils,
-  AWSTests.TestBase,
+  System.SysUtils, System.Net.HttpClient, System.JSON, System.StrUtils,
   TestFramework,
-  Bcl.Json,
-  Bcl.Json.Classes,
+  AWSTests.TestBase,
   AWS.Polly,
-  AWS.RegionEndpoints;
+  AWS.RegionEndpoints,
+  AWS.SDKUtils;
 
 type
   TPollyTests = class(TAWSTestBase)
   private
     function GetMp3Request: ISynthesizeSpeechRequest;
     function GetSpeechMarkRequest: ISynthesizeSpeechRequest;
-    procedure AssertSpeechMarks(data: TJObject);
+    procedure AssertSpeechMarks(data: TJSONObject);
     function AssertPresignedUrl(const AUrl: string): TArray<Byte>;
+    function ParseJsonStream(const Json: string): TJSONObject;
     {TODO: Presigned with session token}
 //    procedure PresignedUrlWithSessionToken;
   published
@@ -31,7 +31,6 @@ type
 implementation
 
 uses
-  Sparkle.Http.Client,
   AWS.Polly.SynthesizeSpeechUtil,
   AWS.Runtime.HttpRequestMessageFactory;
 
@@ -41,12 +40,12 @@ procedure TPollyTests.APIWithSpeechMarks;
 var
   Client: IAmazonPolly;
   Response: ISynthesizeSpeechResponse;
-  Data: TJObject;
+  Data: TJSONObject;
 begin
   Client := TAmazonPollyClient.Create(TRegionEndpoints.USWest2);
   Response := Client.SynthesizeSpeech(GetSpeechMarkRequest);
   CheckEquals(200, Response.HttpStatusCode);
-  Data := TJson.Deserialize<TJObject>(Response.AudioStream);
+  Data := ParseJsonStream(TEncoding.UTF8.GetString(TAWSSDKUtils.StreamToBytes(Response.AudioStream)));
   try
     AssertSpeechMarks(Data);
   finally
@@ -57,18 +56,15 @@ end;
 function TPollyTests.AssertPresignedUrl(const AUrl: string): TArray<Byte>;
 var
   WebClient: THttpClient;
-  Resp: THttpResponse;
+  Resp: IHttpResponse;
 begin
   // download using the PreSigned URL in a totally independent WebClient
-  WebClient := THttpRequestMessageFactory.CreateHttpClient(nil);
+  WebClient := THttpClient.Create;
   try
-    Resp := WebClient.Get(AUrl);
-    try
-      Result := Resp.ContentAsBytes;
-      CheckEquals(200, Resp.StatusCode);
-    finally
-      Resp.Free;
-    end;
+    Resp := WebClient.Execute(WebClient.GetRequest('Get', AUrl));
+    SetLength(Result, Resp.ContentStream.Size);
+    Resp.ContentStream.Read(Result[0], Length(Result));
+    CheckEquals(200, Resp.StatusCode);
   finally
     WebClient.Free;
   end;
@@ -77,13 +73,13 @@ begin
   Check(Length(Result) > 0, 'Empty response');
 end;
 
-procedure TPollyTests.AssertSpeechMarks(data: TJObject);
+procedure TPollyTests.AssertSpeechMarks(data: TJSONObject);
 begin
-  Check(data.Contains('time'), 'time');
-  Check(data.Contains('type'), 'type');
-  Check(data.Contains('start'), 'start');
-  Check(data.Contains('end'), 'end');
-  Check(data.Contains('value'), 'value');
+  Check(data.GetValue('time') <> nil, 'time');
+  Check(data.GetValue('type') <> nil, 'type');
+  Check(data.GetValue('start') <> nil, 'start');
+  Check(data.GetValue('end') <> nil, 'end');
+  Check(data.GetValue('value') <> nil, 'value');
 end;
 
 procedure TPollyTests.EnsureIsUrlEncoded;
@@ -131,15 +127,26 @@ begin
     TRegionEndpoints.USWest2, GetMp3Request));
 end;
 
+function TPollyTests.ParseJsonStream(const Json: string): TJSONObject;
+var
+  Objects: TArray<string>;
+begin
+  Objects := TArray<string>(SplitString(Json, #10));
+  if Length(Objects) > 0 then
+    Result := TJSONObject.ParseJSONValue(Objects[0]) as TJSONObject
+  else
+    Result := nil;
+end;
+
 procedure TPollyTests.PresignedUrlWithSpeechMarks;
 var
   Data: TArray<Byte>;
-  JObj: TJObject;
+  JObj: TJSONObject;
 begin
   Data := AssertPreSignedUrl(
     TSynthesizeSpeechUtil.GeneratePresignedUrl(TRegionEndpoints.USWest2,
     GetSpeechMarkRequest));
-  JObj := TJson.Deserialize<TJObject>(TEncoding.UTF8.GetString(Data));
+  JObj := ParseJsonStream(TEncoding.UTF8.GetString(Data));
   try
     AssertSpeechMarks(JObj);
   finally

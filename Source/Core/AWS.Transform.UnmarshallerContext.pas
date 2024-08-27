@@ -6,9 +6,9 @@ interface
 
 uses
   System.Generics.Collections, System.SysUtils, System.Classes, System.StrUtils,
-  Bcl.Collections,
-  Bcl.Xml.Reader,
+  AWS.Xml.Reader,
   AWS.Internal.WebResponseData,
+  AWS.Lib.Collections,
   AWS.Util.Streams;
 
 type
@@ -56,6 +56,7 @@ type
   TXmlUnmarshallerContext = class(TUnmarshallerContext)
   strict private
     FStream: TStream;
+    FResponseStream: TStream;
     FAllowEmptyElementLookup: HashSet<string>;
     FXmlReader: TXmlReader;
     FStackString: string;
@@ -71,8 +72,6 @@ type
     class function StackToPath(AStack: TStack<string>): string;
   strict protected
     function XmlReader: TXmlReader;
-    property Stream: TStream read FStream;
-    property AllowEmptyElementLookup: HashSet<string> read FAllowEmptyElementLookup;
   public
     function CurrentPath: string; override;
     function CurrentDepth: Integer; override;
@@ -82,10 +81,13 @@ type
     function IsEndElement: Boolean; override;
     function IsStartOfDocument: Boolean; override;
     function IsAttribute: Boolean;
+    property AllowEmptyElementLookup: HashSet<string> read FAllowEmptyElementLookup;
   public
     constructor Create(AResponseStream: TStream; AMaintainResponseBody: Boolean;
       AResponseData: IWebResponseData; AIsException: Boolean = false); reintroduce;
     destructor Destroy; override;
+    function ExtractStream: TStream;
+    property Stream: TStream read FStream;
   end;
 
 implementation
@@ -189,6 +191,7 @@ var
   SizeLimit: Integer;
 begin
   inherited Create;
+  FResponseStream := AResponseStream;
   SizeLimit := TAWSConfigs.LoggingConfig.LogResponsesSizeLimit;
   if IsException then
     SetWrappingStream(TCachingWrapperStream.Create(AResponseStream, False, SizeLimit, MaxInt))
@@ -224,6 +227,11 @@ begin
   FXmlReader.Free;
   FStack.Free;
   inherited;
+end;
+
+function TXmlUnmarshallerContext.ExtractStream: TStream;
+begin
+  Result := FResponseStream;
 end;
 
 function TXmlUnmarshallerContext.IsAttribute: Boolean;

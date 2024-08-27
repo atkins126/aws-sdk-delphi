@@ -7,41 +7,42 @@ interface
 uses
   System.Generics.Defaults, System.Generics.Collections, System.SysUtils, System.StrUtils,
   System.DateUtils,
-  Bcl.Collections,
-  AWS.Runtime.ClientConfig,
+  AWS.Enums,
+  AWS.Internal.Auth.AWS4SignerHelper,
   AWS.Internal.Request,
+  AWS.Internal.Util.ChunkedUploadWrapperStream,
+  AWS.Lib.Collections,
+  AWS.RegionEndpoint,
+  AWS.Runtime.ClientConfig,
   AWS.SDKUtils,
-  AWS.RegionEndpoint;
+  AWS.Util.Crypto;
 
 type
   TClientProtocol = (Unknown, QueryStringProtocol, RestProtocol);
 
+  TAWS4Signer = class;
+
   TAbstractAWSSigner = class
+  strict private
+    FAWS4Signer: TAWS4Signer;
+    function AWS4SignerInstance: TAWS4Signer;
+  strict protected
+    function SelectSigner(ARequest: IRequest; AConfig: IClientConfig): TAbstractAWSSigner; overload;
+    function SelectSigner(ADefaultSigner: TAbstractAWSSigner; AUseSigV4Setting: Boolean; ARequest: IRequest;
+      AConfig: IClientConfig): TAbstractAWSSigner; overload;
+
+    /// <summary>
+    /// Inspects the supplied evidence to return the signer appropriate for the operation
+    /// </summary>
+    /// <param name="useSigV4Setting">Global setting for the service</param>
+    /// <param name="request">The request.</param>
+    /// <param name="config">Configuration for the client</param>
+    /// <returns>True if signature v4 request signing should be used</returns>
+    class function UseV4Signing(AUseSigV4Setting: Boolean; ARequest: IRequest; AConfig: IClientConfig): Boolean;
   public
+    destructor Destroy; override;
     procedure Sign(ARequest: IRequest; AClientConfig: IClientConfig; const AAWSAccessKeyId, AAWSSecretAccessKey: string); virtual; abstract;
     function Protocol: TClientProtocol; virtual; abstract;
-  end;
-
-  TAWS4SigningResult = record
-  strict private
-    FAAwsAccessKeyId: string;
-    FOriginalDateTime: TDateTime;
-    FSignedHeaders: string;
-    FScope: string;
-    FSigningKey: TArray<Byte>;
-    FSignature: TArray<Byte>;
-  public
-    constructor Create(const AAwsAccessKeyId: string; ASignedAt: TDateTime;
-      const ASignedHeaders, AScope: string; const ASigningKey, ASignature: TArray<Byte>);
-    function ForAuthorizationHeader: string;
-    function ForQueryParameters: string;
-    function AccessKeyId: string;
-    function SignedHeaders: string;
-    function Scope: string;
-    function SigningKey: TArray<Byte>;
-    function Signature: string;
-    function SignatureBytes: TArray<Byte>;
-    function ISO8601DateTime: string;
   end;
 
   /// <summary>
@@ -49,18 +50,7 @@ type
   /// </summary>
   TAWS4Signer = class(TAbstractAWSSigner)
   public const
-    Scheme = 'AWS4';
-    Algorithm = 'HMAC-SHA256';
-    AWS4AlgorithmTag = Scheme + '-' + Algorithm;
     Terminator = 'aws4_request';
-    Credential = 'Credential';
-    SignedHeaders = 'SignedHeaders';
-    Signature = 'Signature';
-    EmptyBodySha256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-    StreamingBodySha256 = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD';
-    AWSChunkedEncoding = 'aws-chunked';
-    UnsignedPayload = 'UNSIGNED-PAYLOAD';
-    SignerAlgorithm = TSigningAlgorithm.HmacSHA256;
     class var TerminatorBytes: TArray<Byte>;
     class var FHeadersToIgnoreWhenSigning: HashSet<string>;
   strict private
@@ -115,14 +105,9 @@ type
   end;
 
   TAWS4PreSignedUrlSigner = class(TAWS4Signer)
-  private const
-    // 7 days is the maximum period for presigned url expiry with AWS4
+  public const
+    // 7days is the maximum period for presigned url expiry with AWS4
     MaxAWS4PreSignedUrlExpiry: Int64 = 7 * 24 * 60 * 60;
-
-    XAmzSignature = 'X-Amz-Signature';
-    XAmzAlgorithm = 'X-Amz-Algorithm';
-    XAmzCredential = 'X-Amz-Credential';
-    XAmzExpires = 'X-Amz-Expires';
   private
     class function IsServiceUsingUnsignedPayload(const AService: string): Boolean; static;
   public
@@ -201,7 +186,6 @@ implementation
 
 uses
   AWS.Runtime.Exceptions,
-  AWS.Util.Crypto,
   AWS.Internal.IRegionEndpoint;
 
 { TAWS4Signer }
@@ -333,11 +317,11 @@ var
   HashService: TArray<Byte>;
 begin
   try
-    KSecret := Scheme + AAwsSecretAccessKey;
-    HashDate := ComputeKeyedHash(SignerAlgorithm, TEncoding.UTF8.GetBytes(KSecret), TEncoding.UTF8.GetBytes(ADate));
-    HashRegion := ComputeKeyedHash(SignerAlgorithm, HashDate, TEncoding.UTF8.GetBytes(ARegion));
-    HashService := ComputeKeyedHash(SignerAlgorithm, HashRegion, TEncoding.UTF8.GetBytes(AService));
-    Result := ComputeKeyedHash(SignerAlgorithm, HashService, TerminatorBytes);
+    KSecret := TAWS4SignerConsts.Scheme + AAwsSecretAccessKey;
+    HashDate := ComputeKeyedHash(TAWS4SignerConsts.SignerAlgorithm, TEncoding.UTF8.GetBytes(KSecret), TEncoding.UTF8.GetBytes(ADate));
+    HashRegion := ComputeKeyedHash(TAWS4SignerConsts.SignerAlgorithm, HashDate, TEncoding.UTF8.GetBytes(ARegion));
+    HashService := ComputeKeyedHash(TAWS4SignerConsts.SignerAlgorithm, HashRegion, TEncoding.UTF8.GetBytes(AService));
+    Result := ComputeKeyedHash(TAWS4SignerConsts.SignerAlgorithm, HashService, TerminatorBytes);
   finally
     FillChar(KSecret[1], Length(KSecret) * 2, 0);
   end;
@@ -345,7 +329,7 @@ end;
 
 class function TAWS4Signer.ComputeHash(const AData: TArray<Byte>): TArray<Byte>;
 begin
-  Result := TCryptoUtilFactory.CryptoInstance.ComputeSHA256Hash(AData);
+  Result := TAWS4SignerUtils.ComputeHash(AData);
 end;
 
 class function TAWS4Signer.ComputeKeyedHash(AAlgorithm: TSigningAlgorithm; const AKey,
@@ -356,7 +340,7 @@ end;
 
 class function TAWS4Signer.ComputeHash(const AData: string): TArray<Byte>;
 begin
-  Result := ComputeHash(TEncoding.UTF8.GetBytes(AData));
+  Result := TAWS4SignerUtils.ComputeHash(AData);
 end;
 
 class function TAWS4Signer.ComputeSignature(const AAWSAccessKey, AAWSSecretAccessKey, ARegion: string;
@@ -372,14 +356,14 @@ begin
   Scope := Format('%s/%s/%s/%s', [DateStamp, ARegion, AService, Terminator]);
 
   StringToSign := Format('%s-%s'#10'%s'#10'%s'#10,
-    [Scheme,
-     Algorithm,
+    [TAWS4SignerConsts.Scheme,
+     TAWS4SignerConsts.Algorithm,
      FormatDateTime(TAWSSDKUtils.ISO8601BasicDateTimeFormat, ASignedAt),
      Scope]);
 
   StringToSign := StringToSign + TAWSSDKUtils.ToHex(ComputeHash(ACanonicalRequest), True);
   Key := ComposeSigningKey(AAWSSecretAccessKey, ARegion, DateStamp, AService);
-  Signature := ComputeKeyedHash(SignerAlgorithm, Key, TEncoding.UTF8.GetBytes(StringToSign));
+  Signature := ComputeKeyedHash(TAWS4SignerConsts.SignerAlgorithm, Key, TEncoding.UTF8.GetBytes(StringToSign));
   Result := TAWS4SigningResult.Create(AAWSAccessKey, ASignedAt, ASignedHeaders, Scope,
     Key, Signature);
 end;
@@ -482,7 +466,7 @@ class function TAWS4Signer.GetRequestPayloadBytes(ARequest: IRequest): TArray<By
 var
   Content: string;
 begin
-  if Length(ARequest.Content) > 0 then
+  if ARequest.IsSetContent then
     Result := ARequest.Content
   else
   begin
@@ -544,8 +528,25 @@ begin
 
   // otherwise continue to calculate the hash and set it in the headers before returning
   if ARequest.UseChunkEncoding then
-    {TODO: Support chunk encoding}
-    raise EInvalidOpException.Create('ChunkEncoding not yet supported.')
+  begin
+    ComputedContentHash := TAWS4SignerConsts.StreamingBodySha256;
+    if ARequest.Headers.ContainsKey(THeaderKeys.ContentLengthHeader) then
+    begin
+      // substitute the originally declared content length with the true size of
+      // the data we'll upload, which is inflated with chunk metadata
+      ARequest.Headers.AddOrSetValue(THeaderKeys.XAmzDecodedContentLengthHeader, ARequest.Headers[THeaderKeys.ContentLengthHeader]);
+      var originalContentLength := StrToInt64(ARequest.Headers[THeaderKeys.ContentLengthHeader]);
+      ARequest.Headers.AddOrSetValue(THeaderKeys.ContentLengthHeader,
+        IntToStr(TChunkedUploadWrapperStream.ComputeChunkedContentLength(originalContentLength)));
+    end;
+
+    if ARequest.Headers.ContainsKey(THeaderKeys.ContentEncodingHeader) then
+    begin
+      var originalEncoding := ARequest.Headers[THeaderKeys.ContentEncodingHeader];
+      if not originalEncoding.Contains(TAWS4SignerConsts.AWSChunkedEncoding) then
+        ARequest.Headers.AddOrSetValue(THeaderKeys.ContentEncodingHeader, originalEncoding + ', ' + TAWS4SignerConsts.AWSChunkedEncoding);
+    end;
+  end
   else
   begin
     if ARequest.ContentStream <> nil then
@@ -559,7 +560,7 @@ begin
   end;
 
   if ComputedContentHash = '' then
-    ComputedContentHash := UnsignedPayload;
+    ComputedContentHash := TAWS4SignerConsts.UnsignedPayload;
 
   SetPayloadSignatureHeader(ARequest, ComputedContentHash);
   Result := ComputedContentHash;
@@ -571,7 +572,11 @@ var
   SigningResult: TAWS4SigningResult;
 begin
   SigningResult := SignRequest(ARequest, AClientConfig, AAWSAccessKeyId, AAWSSecretAccessKey);
-  ARequest.Headers.AddOrSetValue(THeaderKeys.AuthorizationHeader, SigningResult.ForAuthorizationHeader);
+  try
+    ARequest.Headers.AddOrSetValue(THeaderKeys.AuthorizationHeader, SigningResult.ForAuthorizationHeader);
+  finally
+    SigningResult.Free;
+  end;
 end;
 
 function TAWS4Signer.SignRequest(ARequest: IRequest; AClientConfig: IClientConfig; const AAWSAccessKeyId,
@@ -645,72 +650,6 @@ begin
     raise EAmazonClientException.Create('When DisablePayloadSigning is true, the request must be sent over HTTPS.');
 end;
 
-{ TAWS4SigningResult }
-
-function TAWS4SigningResult.AccessKeyId: string;
-begin
-  Result := FAAwsAccessKeyId;
-end;
-
-constructor TAWS4SigningResult.Create(const AAwsAccessKeyId: string; ASignedAt: TDateTime; const ASignedHeaders,
-  AScope: string; const ASigningKey, ASignature: TArray<Byte>);
-begin
-  FAAwsAccessKeyId := AAwsAccessKeyId;
-  FOriginalDateTime := ASignedAt;
-  FSignedHeaders := ASignedHeaders;
-  FScope := AScope;
-  FSigningKey := ASigningKey;
-  FSignature := ASignature;
-end;
-
-function TAWS4SigningResult.ForAuthorizationHeader: string;
-begin
-  Result := TAWS4Signer.AWS4AlgorithmTag;
-  Result := Result + Format(' %s=%s/%s,', [TAWS4Signer.Credential, AccessKeyId, Scope]);
-  Result := Result + Format(' %s=%s,', [TAWS4Signer.SignedHeaders, SignedHeaders]);
-  Result := Result + Format(' %s=%s', [TAWS4Signer.Signature, Signature]);
-end;
-
-function TAWS4SigningResult.ForQueryParameters: string;
-begin
-  Result := '';
-  Result := Result + Format('%s=%s', [TAWS4PreSignedUrlSigner.XAmzAlgorithm, TAWS4Signer.AWS4AlgorithmTag]);
-  Result := Result + Format('&%s=%s', [TAWS4PreSignedUrlSigner.XAmzCredential, Format('%s/%s', [AccessKeyId, Scope])]);
-  Result := Result + Format('&%s=%s', [THeaderKeys.XAmzDateHeader, ISO8601DateTime]);
-  Result := Result + Format('&%s=%s', [THeaderKeys.XAmzSignedHeadersHeader, SignedHeaders]);
-  Result := Result + Format('&%s=%s', [TAWS4PreSignedUrlSigner.XAmzSignature, Signature]);
-end;
-
-function TAWS4SigningResult.ISO8601DateTime: string;
-begin
-  Result := FormatDateTime(TAWSSDKUtils.ISO8601BasicDateTimeFormat, FOriginalDateTime);
-end;
-
-function TAWS4SigningResult.Scope: string;
-begin
-  Result := FScope;
-end;
-
-function TAWS4SigningResult.Signature: string;
-begin
-  Result := TAWSSDKUtils.ToHex(FSignature, True);
-end;
-
-function TAWS4SigningResult.SignatureBytes: TArray<Byte>;
-begin
-  Result := FSignature;
-end;
-
-function TAWS4SigningResult.SignedHeaders: string;
-begin
-  Result := FSignedHeaders;
-end;
-
-function TAWS4SigningResult.SigningKey: TArray<Byte>;
-begin
-  Result := FSigningKey;
-end;
-
 { AWS4PreSignedUrlSigner }
 
 function TAWS4PreSignedUrlSigner.SignRequest(ARequest: IRequest; AClientConfig: IClientConfig; const AAwsAccessKeyId,
@@ -749,9 +688,8 @@ begin
   if not ARequest.Headers.ContainsKey(THeaderKeys.HostHeader) then
   begin
     HostHeader := ARequest.Endpoint.Host;
-    {TODO: Review this}
-//    if not ARequest.Endpoint.IsDefaultPort then
-//      HostHeader := HostHeader + ':' + ARequest.Endpoint.Port;
+    if not ARequest.Endpoint.IsDefaultPort then
+      HostHeader := HostHeader + ':' + IntToStr(ARequest.Endpoint.Port);
     ARequest.Headers.Add(THeaderKeys.HostHeader, HostHeader);
   end;
 
@@ -777,14 +715,14 @@ begin
     SetLength(ParametersToCanonicalize, Index + 4);
 
     ParametersToCanonicalize[Index] := TPair<string,string>
-      .Create(XAmzAlgorithm, AWS4AlgorithmTag);
+      .Create(TAWS4PreSignedUrlSignerConsts.XAmzAlgorithm, TAWS4SignerConsts.AWS4AlgorithmTag);
 
     XAmzCredentialValue := Format('%s/%s/%s/%s/%s',
       [AAwsAccessKeyId, FormatDateTime(TAWSSDKUtils.ISO8601BasicDateFormat, SignedAt),
        Region, AService, Terminator]);
     Inc(Index);
     parametersToCanonicalize[Index] := TPair<string,string>
-      .Create(XAmzCredential, xAmzCredentialValue);
+      .Create(TAWS4PreSignedUrlSignerConsts.XAmzCredential, xAmzCredentialValue);
 
     Inc(Index);
     parametersToCanonicalize[Index] := TPair<string,string>
@@ -799,9 +737,9 @@ begin
     CanonicalQueryParameters := CanonicalizeQueryParameters(ParametersToCanonicalize);
 
     if IsServiceUsingUnsignedPayload(AService) then
-      BodyHash := UnsignedPayload
+      BodyHash := TAWS4SignerConsts.UnsignedPayload
     else
-      BodyHash := EmptyBodySha256;
+      BodyHash := TAWS4SignerConsts.EmptyBodySha256;
 
     CanonicalRequest := CanonicalizeRequest(ARequest.Endpoint, ARequest.ResourcePath,
       ARequest.HttpMethod, SortedHeaders, CanonicalQueryParameters, BodyHash,
@@ -811,6 +749,77 @@ begin
       SignedAt, AService, CanonicalizedHeaderNames, CanonicalRequest);
   finally
     SortedHeaders.Free;
+  end;
+end;
+
+{ TAbstractAWSSigner }
+
+function TAbstractAWSSigner.SelectSigner(ARequest: IRequest; AConfig: IClientConfig): TAbstractAWSSigner;
+begin
+  Result := SelectSigner(Self, False, ARequest, AConfig);
+end;
+
+function TAbstractAWSSigner.AWS4SignerInstance: TAWS4Signer;
+begin
+  if FAWS4Signer = nil then
+  begin
+    TMonitor.Enter(Self);
+    try
+      if FAWS4Signer = nil then
+        FAWS4Signer := TAWS4Signer.Create;
+    finally
+      TMonitor.Exit(Self);
+    end;
+  end;
+  Result := FAWS4Signer;
+end;
+
+destructor TAbstractAWSSigner.Destroy;
+begin
+  FAWS4Signer.Free;
+  inherited;
+end;
+
+function TAbstractAWSSigner.SelectSigner(ADefaultSigner: TAbstractAWSSigner; AUseSigV4Setting: Boolean; ARequest: IRequest;
+  AConfig: IClientConfig): TAbstractAWSSigner;
+begin
+  var usev4Signing := UseV4Signing(AUseSigV4Setting, ARequest, AConfig);
+  if usev4Signing then
+    Result := AWS4SignerInstance
+  else
+    Result := ADefaultSigner;
+end;
+
+class function TAbstractAWSSigner.UseV4Signing(AUseSigV4Setting: Boolean; ARequest: IRequest; AConfig: IClientConfig): Boolean;
+begin
+  if ARequest.UseSigV4 or (AConfig.SignatureVersion = '4') or (AUseSigV4Setting and (AConfig.SignatureVersion <> '2')) then
+    Exit(True)
+  else
+  begin
+    // do a cascading series of checks to try and arrive at whether we have
+    // a recognisable region; this is required to use the AWS4 signer
+    var r: IRegionEndpointEx := nil;
+    if not string.IsNullOrEmpty(ARequest.AuthenticationRegion) then
+      r := TRegionEndpoint.GetBySystemName(ARequest.AuthenticationRegion);
+
+    if (r = nil) and not string.IsNullOrEmpty(AConfig.ServiceURL) then
+    begin
+      var parsedRegion := TAWSSDKUtils.DetermineRegion(AConfig.ServiceURL);
+      if not string.IsNullOrEmpty(parsedRegion) then
+        r := TRegionEndpoint.GetBySystemName(parsedRegion);
+    end;
+
+    if (r = nil) and (AConfig.RegionEndpoint <> nil) then
+      r := AConfig.RegionEndpoint;
+
+    if (r <> nil) then
+    begin
+      var endpoint := r.GetEndpointForService(AConfig.RegionEndpointServiceName, AConfig.UseDualstackEndpoint);
+      if (endpoint <> nil) and ((endpoint.SignatureVersionOverride = '4') or string.IsNullOrEmpty(endpoint.SignatureVersionOverride)) then
+        Exit(True);
+    end;
+
+    Exit(False);
   end;
 end;
 

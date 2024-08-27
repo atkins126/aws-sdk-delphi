@@ -4,6 +4,7 @@ interface
 
 uses
   System.Generics.Collections, System.Classes,
+  AWS.Internal.Auth.AWS4SignerHelper,
   AWS.Internal.ParameterCollection,
   AWS.Internal.ParameterDictionary,
   AWS.SDKUtils,
@@ -55,8 +56,14 @@ type
     procedure SetUseChunkEncoding(const Value: Boolean);
     function GetSuppress404Exceptions: Boolean;
     procedure SetSuppress404Exceptions(const Value: Boolean);
+    function GetAWS4SignerResult: TAWS4SigningResult;
+    procedure SetAWS4SignerResult(const Value: TAWS4SigningResult);
     function GetOriginalStreamPosition: Int64;
     procedure SetOriginalStreamPosition(const Value: Int64);
+    function GetCanonicalResourcePrefix: string;
+    procedure SetCanonicalResourcePrefix(const Value: string);
+    function GetHostPrefix: string;
+    procedure SetHostPrefix(const Value: string);
 
     function MayContainRequestBody: Boolean;
     function HasRequestBody: Boolean;
@@ -65,6 +72,14 @@ type
     procedure AddPathResource(const AKey, AValue: string);
     function GetHeaderValue(const AHeaderName: string): string;
     function ComputeContentStreamHash: string;
+    function IsSetContent: Boolean;
+
+    /// <summary>
+    /// Checks if the request stream can be rewinded.
+    /// </summary>
+    /// <returns>Returns true if the request stream can be rewinded ,
+    /// else false.</returns>
+    function IsRequestStreamRewindable: Boolean;
 
     property RequestName: string read GetRequestName;
     property ServiceName: string read GetServiceName;
@@ -92,7 +107,22 @@ type
     property AuthenticationRegion: string read GetAuthenticationRegion write SetAuthenticationRegion;
     property UseChunkEncoding: Boolean read GetUseChunkEncoding write SetUseChunkEncoding;
     property Suppress404Exceptions: Boolean read GetSuppress404Exceptions write SetSuppress404Exceptions;
+    property AWS4SignerResult: TAWS4SigningResult read GetAWS4SignerResult write SetAWS4SignerResult;
     property OriginalStreamPosition: Int64 read GetOriginalStreamPosition write SetOriginalStreamPosition;
+
+    /// <summary>
+    /// Used for Amazon S3 requests where the bucket name is removed from
+    /// the marshalled resource path into the host header. To comply with
+    /// AWS2 signature calculation, we need to recover the bucket name
+    /// and include it in the resource canonicalization, which we do using
+    /// this field.
+    /// </summary>
+    property CanonicalResourcePrefix: string read GetCanonicalResourcePrefix write SetCanonicalResourcePrefix;
+
+    /// <summary>
+    /// Host prefix value to prepend to the endpoint for this request, if any.
+    /// </summary>
+    property HostPrefix: string read GetHostPrefix write SetHostPrefix;
   end;
 
 implementation

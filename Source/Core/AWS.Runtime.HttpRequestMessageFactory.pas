@@ -3,14 +3,12 @@ unit AWS.Runtime.HttpRequestMessageFactory;
 interface
 
 uses
-  System.Generics.Collections, System.SysUtils, System.Classes,
+  System.Generics.Collections, System.SysUtils, System.Classes, System.Net.HttpClient,
+  AWS.Internal.Util.ChunkedUploadWrapperStream,
+  AWS.Lib.HttpHeaders,
   AWS.Runtime.Contexts,
   AWS.Runtime.ClientConfig,
   AWS.Runtime.IHttpRequestFactory,
-  Sparkle.Http.Client,
-  {$IFDEF MSWINDOWS}
-  Sparkle.WinHttp.Engine,
-  {$ENDIF}
   AWS.SDKUtils,
   AWS.Internal.WebResponseData;
 
@@ -37,29 +35,32 @@ type
       THeaderKeys.Expires
     );
   strict private
-    FRequest: THttpRequest;
+    FRequest: IHttpRequest;
+    FRequestUri: string;
     FHttpClient: THttpClient;
     FClientConfig: IClientConfig;
+    FOwnsSourceStream: Boolean;
     function GetMethod: string;
     procedure SetMethod(const Value: string);
     function GetRequestUri: string;
+    procedure WriteContentHeaders(ContentHeaders: TDictionary<string, string>);
+    procedure CheckRequest;
   public
     constructor Create(AHttpClient: THttpClient; ARequestUri: string; AConfig: IClientConfig);
     destructor Destroy; override;
     procedure ConfigureRequest(ARequestContext: TRequestContext);
     procedure SetRequestHeaders(AHeaders: TDictionary<string, string>);
     procedure WriteToRequestBody(const Content: TArray<Byte>; AHeaders: TDictionary<string, string>); overload;
-    procedure WriteToRequestBody(Stream: TStream; AHeaders: TDictionary<string, string>); overload;
+    procedure WriteToRequestBody(Stream: TStream; AHeaders: TDictionary<string, string>; AOwnsStream: Boolean); overload;
     function GetResponse: IWebResponseData;
     property Method: string read GetMethod write SetMethod;
     property RequestUri: string read GetRequestUri;
     property HttpClient: THttpClient read FHttpClient;
-    property Request: THttpRequest read FRequest;
   end;
 
   THttpClientResponseData = class(TInterfacedObject, IWebResponseData, IHttpResponseBody)
   strict private
-    FResponse: THttpResponse;
+    FResponse: IHttpResponse;
     FHttpClient: THttpClient;
     function GetContentLength: Integer;
     function GetContentType: string;
@@ -67,12 +68,13 @@ type
     function GetIsSuccessStatusCode: Boolean;
     function GetResponseBody: IHttpResponseBody;
   public
-    constructor Create(AResponse: THttpResponse; AHttpClient: THttpClient);
+    constructor Create(AResponse: IHttpResponse; AHttpClient: THttpClient);
     destructor Destroy; override;
-    property Response: THttpResponse read FResponse;
+    property Response: IHttpResponse read FResponse;
     function OpenResponse: TStream;
     function IsHeaderPresent(const AHeaderName: string): Boolean;
     function GetHeaderValue(const AHeaderName: string): string;
+    function GetHeaderNames: TArray<string>;
     property ContentLength: Integer read GetContentLength;
     property ContentType: string read GetContentType;
     property StatusCode: Integer read GetStatusCode;
@@ -111,12 +113,16 @@ class function THttpRequestMessageFactory.CreateManagedHttpClient(AClientConfig:
 begin
   {TODO: Several options not implemented, including timeout}
   Result := THttpClient.Create;
-  {$IFDEF MSWINDOWS}
-  TWinHttpEngine(Result.Engine).ProxyMode := THttpProxyMode.Auto;
-  {$ENDIF}
+  Result.HandleRedirects := AClientConfig.AllowAutoRedirect;
 end;
 
 { THttpWebRequestMessage }
+
+procedure THttpWebRequestMessage.CheckRequest;
+begin
+  if FRequest = nil then
+    raise EInvalidOpException.Create('Request is nil, method string was not set');
+end;
 
 procedure THttpWebRequestMessage.ConfigureRequest(ARequestContext: TRequestContext);
 begin
@@ -128,38 +134,50 @@ begin
   inherited Create;
   FHttpClient := AHttpClient;
   FClientConfig := AConfig;
-  FRequest := FHttpClient.CreateRequest;
-  FRequest.Uri := ARequestUri;
+  FRequestUri := ARequestUri;
 end;
 
 destructor THttpWebRequestMessage.Destroy;
 begin
-  FRequest.Free;
+{$IFNDEF AUTOREFCOUNT}
+  if (FRequest <> nil) and FOwnsSourceStream then
+    FRequest.SourceStream.Free;
+{$ENDIF}
   FHttpClient.Free;
   inherited;
 end;
 
 function THttpWebRequestMessage.GetMethod: string;
 begin
-  Result := FRequest.Method;
+  if FRequest <> nil then
+    Result := FRequest.MethodString
+  else
+    Result := '';
 end;
 
 function THttpWebRequestMessage.GetRequestUri: string;
 begin
-  Result := FRequest.Uri;
+  Result := FRequestUri;
 end;
 
 function THttpWebRequestMessage.GetResponse: IWebResponseData;
 var
-  ResponseMessage: THttpResponse;
+  ResponseMessage: IHttpResponse;
 begin
   // From GetResponseAsync
   if FHttpClient = nil then
     raise EInvalidOpException.Create('The response was already retrieved');
+  CheckRequest;
 
-  ResponseMessage := FHttpClient.Send(FRequest);
+  ResponseMessage := FHttpClient.Execute(FRequest);
+
   Result := THttpClientResponseData.Create(ResponseMessage, FHttpClient);
   FHttpClient := nil;
+
+  // If AllowAutoRedirect is set to false, HTTP 3xx responses are returned back as response.
+  if not FClientConfig.AllowAutoRedirect and
+    (ResponseMessage.StatusCode >= 300) and (ResponseMessage.StatusCode < 400) then
+    Exit;
 
   if (ResponseMessage.StatusCode < 200) or (ResponseMessage.StatusCode >= 300) then
     raise EHttpErrorResponseException.Create(Result)
@@ -167,7 +185,7 @@ end;
 
 procedure THttpWebRequestMessage.SetMethod(const Value: string);
 begin
-  FRequest.Method := Value;
+  FRequest := FHttpClient.GetRequest(Value, FRequestUri);
 end;
 
 procedure THttpWebRequestMessage.SetRequestHeaders(AHeaders: TDictionary<string, string>);
@@ -176,6 +194,7 @@ var
   ContentHeader: string;
   Kvp: TPair<string, string>;
 begin
+  CheckRequest;
   for Kvp in AHeaders do
   begin
     IsContentHeader := False;
@@ -187,32 +206,53 @@ begin
       end;
 
     if not IsContentHeader then
-      FRequest.Headers.SetValue(Kvp.Key, Kvp.Value);
+      FRequest.SetHeaderValue(Kvp.Key, Kvp.Value);
   end;
 end;
 
-procedure THttpWebRequestMessage.WriteToRequestBody(Stream: TStream; AHeaders: TDictionary<string, string>);
-var
-  BytesStream: TBytesStream;
+procedure THttpWebRequestMessage.WriteContentHeaders(ContentHeaders: TDictionary<string, string>);
 begin
-  BytesStream := TBytesStream.Create;
-  try
-    BytesStream.CopyFrom(Stream);
-    BytesStream.Size := Stream.Size;
-    WriteToRequestBody(BytesStream.Bytes, AHeaders);
-  finally
-    BytesStream.Free;
-  end;
+  var ContentType := '';
+  ContentHeaders.TryGetValue(THeaderKeys.ContentTypeHeader, ContentType);
+  FRequest.SetHeaderValue(THeaderKeys.ContentTypeHeader, ContentType);
+
+  if ContentHeaders.ContainsKey(THeaderKeys.ContentRangeHeader) then
+    FRequest.SetHeaderValue(THeaderKeys.ContentRangeHeader, ContentHeaders[THeaderKeys.ContentRangeHeader]);
+
+  if ContentHeaders.ContainsKey(THeaderKeys.ContentMD5Header) then
+    FRequest.SetHeaderValue(THeaderKeys.ContentMD5Header, ContentHeaders[THeaderKeys.ContentMD5Header]);
+
+  if ContentHeaders.ContainsKey(THeaderKeys.ContentEncodingHeader) then
+    FRequest.SetHeaderValue(THeaderKeys.ContentEncodingHeader, ContentHeaders[THeaderKeys.ContentEncodingHeader]);
+
+  if ContentHeaders.ContainsKey(THeaderKeys.ContentDispositionHeader) then
+    FRequest.SetHeaderValue(THeaderKeys.ContentDispositionHeader, ContentHeaders[THeaderKeys.ContentDispositionHeader]);
+
+  if ContentHeaders.ContainsKey(THeaderKeys.Expires) then
+    FRequest.SetHeaderValue(THeaderKeys.Expires, ContentHeaders[THeaderKeys.Expires]);
+end;
+
+procedure THttpWebRequestMessage.WriteToRequestBody(Stream: TStream; AHeaders: TDictionary<string, string>; AOwnsStream: Boolean);
+begin
+  CheckRequest;
+  FRequest.SourceStream := Stream;
+  FOwnsSourceStream := AOwnsStream;
+  if (Stream is TChunkedUploadWrapperStream) and TChunkedUploadWrapperStream(Stream).HasLength then
+    FRequest.SetHeaderValue(THeaderKeys.ContentLengthHeader, IntToStr(Stream.Size));
+  WriteContentHeaders(AHeaders);
 end;
 
 procedure THttpWebRequestMessage.WriteToRequestBody(const Content: TArray<Byte>; AHeaders: TDictionary<string, string>);
 begin
-  FRequest.SetContent(Content);
+  CheckRequest;
+  FRequest.SourceStream := TBytesStream.Create(Content);
+  FOwnsSourceStream := True;
+  WriteContentHeaders(AHeaders);
 end;
 
 { THttpClientResponseData }
 
-constructor THttpClientResponseData.Create(AResponse: THttpResponse; AHttpClient: THttpClient);
+constructor THttpClientResponseData.Create(AResponse: IHttpResponse; AHttpClient: THttpClient);
 begin
   inherited Create;
   FResponse := AResponse;
@@ -221,7 +261,6 @@ end;
 
 destructor THttpClientResponseData.Destroy;
 begin
-  FResponse.Free;
   FHttpClient.Free;
   inherited;
 end;
@@ -234,12 +273,20 @@ end;
 
 function THttpClientResponseData.GetContentType: string;
 begin
-  Result := FResponse.ContentType;
+  Result := FResponse.GetHeaderValue(THeaderKeys.ContentTypeHeader);
+end;
+
+function THttpClientResponseData.GetHeaderNames: TArray<string>;
+begin
+  var Headers := FResponse.GetHeaders;
+  SetLength(Result, Length(Headers));
+  for var I := 0 to Length(Headers) - 1 do
+    Result[I] := Headers[I].Name;
 end;
 
 function THttpClientResponseData.GetHeaderValue(const AHeaderName: string): string;
 begin
-  Result := FResponse.Headers.Get(AHeaderName);
+  Result := FResponse.GetHeaderValue(AHeaderName);
 end;
 
 function THttpClientResponseData.GetIsSuccessStatusCode: Boolean;
@@ -259,12 +306,12 @@ end;
 
 function THttpClientResponseData.IsHeaderPresent(const AHeaderName: string): Boolean;
 begin
-  Result := FResponse.Headers.Exists(AHeaderName);
+  Result := FResponse.ContainsHeader(AHeaderName);
 end;
 
 function THttpClientResponseData.OpenResponse: TStream;
 begin
-  Result := FResponse.ContentAsStream;
+  Result := FResponse.ContentStream;
 end;
 
 end.

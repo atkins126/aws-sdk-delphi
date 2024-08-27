@@ -4,18 +4,25 @@ interface
 
 uses
   System.Generics.Collections,
-  AWS.Internal.ParameterCollection;
+  AWS.Internal.ParameterCollection,
+  AWS.Json.Utils,
+  AWS.Runtime.Exceptions;
+
 
 type
   IParameterDictionary = interface
     function GetItems(const Key: string): string;
     procedure SetItems(const Key: string; const Value: string);
+    function GetKeys: TArray<string>;
+    function GetValues: TArray<string>;
 
     function Count: Integer;
     procedure Add(const Key, Value: string);
     function ContainsKey(const Key: string): Boolean;
     procedure Remove(const Key: string);
     property Items[const Key: string]: string read GetItems write SetItems; default;
+    property Keys: TArray<string> read GetKeys;
+    property Values: TArray<string> read GetValues;
   end;
 
   TParameterDictionaryFacade = class(TInterfacedObject, IParameterDictionary)
@@ -23,6 +30,8 @@ type
     FParameterCollection: TParameterCollection;
     function GetItems(const Key: string): string;
     procedure SetItems(const Key: string; const Value: string);
+    function GetKeys: TArray<string>;
+    function GetValues: TArray<string>;
     class function ParameterValueToString(PV: TParameterValue): string; static;
     class procedure UpdateParameterValue(PV: TParameterValue; const ANewValue: string); static;
   public
@@ -35,10 +44,6 @@ type
   end;
 
 implementation
-
-uses
-  AWS.Runtime.Exceptions,
-  Bcl.Json;
 
 { TParameterDictionaryFacade }
 
@@ -68,13 +73,27 @@ begin
   Result := ParameterValueToString(FParameterCollection[Key]);
 end;
 
+function TParameterDictionaryFacade.GetKeys: TArray<string>;
+begin
+  SetLength(Result, FParameterCollection.Count);
+  for var I := 0 to FParameterCollection.Count - 1 do
+    Result[I] := FParameterCollection.Keys[I];
+end;
+
+function TParameterDictionaryFacade.GetValues: TArray<string>;
+begin
+  SetLength(Result, FParameterCollection.Count);
+  for var I := 0 to FParameterCollection.Count - 1 do
+    Result[I] := ParameterValueToString(FParameterCollection.Values[I]);
+end;
+
 class function TParameterDictionaryFacade.ParameterValueToString(PV: TParameterValue): string;
 begin
   if PV is TStringParameterValue then
     Result := TStringParameterValue(PV).Value
   else
   if PV is TStringListParameterValue then
-    Result := TJson.Serialize(TStringListParameterValue(PV).Value)
+    Result := JsonSerialize(TStringListParameterValue(PV).Value)
   else
     raise EAmazonClientException.Create('Unexpected parameter value type ' + PV.ClassName);
 end;
@@ -100,7 +119,7 @@ begin
     TStringParameterValue(PV).Value := ANewValue
   else
   if PV is TStringListParameterValue then
-    TStringListParameterValue(PV).Value := TJson.Deserialize<TList<string>>(ANewValue)
+    TStringListParameterValue(PV).Value := JsonDeserialize_ListString(ANewValue)
   else
     raise EAmazonClientException.Create('Unexpected parameter value type ' + PV.ClassName);
 end;

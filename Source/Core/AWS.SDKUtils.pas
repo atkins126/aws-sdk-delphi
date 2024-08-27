@@ -5,20 +5,27 @@ unit AWS.SDKUtils;
 interface
 
 uses
-  System.Generics.Collections, System.Classes, System.IniFiles, System.SysUtils, System.StrUtils,
-  Sparkle.Uri,
+  System.Generics.Collections, System.Classes, System.IniFiles, System.SysUtils, System.StrUtils, System.DateUtils,
+{$IFDEF USE_SPARKLE}
+  Sparkle.Http.Client,
+  {$IFDEF MSWINDOWS}
+  Sparkle.WinHttp.Engine,
+  {$ENDIF}
+{$ELSE}
+  System.Net.HttpClient,
+{$ENDIF}
+  AWS.Enums,
   AWS.Internal.ParameterCollection,
   AWS.Internal.IRegionEndpoint,
-  Sparkle.Http.Headers;
+  AWS.Lib.HttpHeaders,
+  AWS.Lib.Uri,
+  AWS.Lib.Utils,
+  AWS.Util.Crypto,
+  AWS.Util.Streams;
 
 type
-  IUri = Sparkle.Uri.IUri;
-  TUri = Sparkle.Uri.TUri;
-
-  /// <summary>
-  /// The valid hashing algorithm supported by the sdk for request signing.
-  /// </summary>
-  TSigningAlgorithm = (HmacSHA1, HmacSHA256);
+  IUri = AWS.Lib.Uri.IUri;
+  TUri = AWS.Lib.Uri.TUri;
 
   TProfileIniFile = class(TMemIniFile)
   strict private
@@ -45,12 +52,35 @@ type
     const ISO8601DateFormat = 'yyyy-mm-dd"T"hh:nn:ss.zzz"Z"';
     const DefaultBufferSize = 8192;
     const UrlEncodedContent = 'application/x-www-form-urlencoded; charset=utf-8';
+    const RFC822DateFormat = 'ddd, dd MMM yyyy HH:mm:ss "GMT"';
+    const GMTDateFormat = 'ddd, dd MMM yyyy HH:mm:ss "GMT"';
+
+    const ValidUrlCharacters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~';
+    const ValidUrlCharactersRFC1738 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.';
   strict private
     class var FUserAgent: string;
+    class var FRFC822FormatSettings: TFormatSettings;
+    class var FRFCEncodingSchemes: TDictionary<Integer, string>;
+    class var FValidPathCharacters: string;
+  strict private
+    class function DetermineValidPathCharacters: string;
   public
     // Functions for internal use
     class constructor Create;
+    class destructor Destroy;
     class function GetParametersAsString(AParameterCollection: TParameterCollection): string;
+
+    class procedure CopyStream(Source, Dest: TStream); overload; static;
+    class procedure CopyStream(Source, Dest: TStream; const BufferSize: Integer); overload; static;
+    class function StreamToString(Source: TStream; Encoding: TEncoding = nil): string; static;
+    class function StreamToBytes(Source: TStream): TArray<Byte>; static;
+    class function GetExtension(const Path: string): string;
+    class procedure Sleep(MS: Integer); static;
+    class function TryRfc822ToDateTime(const S: string; var D: TDateTime): Boolean; static;
+    class function Rfc822ToDateTime(const S: string): TDateTime; static;
+    class function EncodeBase64(const Input: TArray<Byte>): string; static;
+    class function DecodeBase64(const Input: string): TArray<Byte>; static;
+    class function SecondsBetween(const ANow, AThen: TDateTime): Int64;
   public
     class function ResolveResourcePath(const AResourcePath: string;
       APathResources: TDictionary<string, string>): string;
@@ -102,7 +132,21 @@ type
     /// <param name="AData">The string to encode</param>
     /// <param name="APath">Whether the string is a URL path or not</param>
     /// <returns>The encoded string</returns>
-    class function UrlEncode(const AData: string; APath: Boolean): string; static;
+    class function UrlEncode(const AData: string; APath: Boolean): string; overload; static;
+
+    /// <summary>
+    /// URL encodes a string per the specified RFC. If the path property is specified,
+    /// the accepted path characters {/+:} are not encoded.
+    /// </summary>
+    /// <param name="RfcNumber">RFC number determing safe characters</param>
+    /// <param name="Data">The string to encode</param>
+    /// <param name="Path">Whether the string is a URL path or not</param>
+    /// <returns>The encoded string</returns>
+    /// <remarks>
+    /// Currently recognised RFC versions are 1738 (Dec '94) and 3986 (Jan '05).
+    /// If the specified RFC is not recognised, 3986 is used by default.
+    /// </remarks>
+    class function UrlEncode(RfcNumber: integer; const Data: string; Path: Boolean): string; overload; static;
 
     /// <summary>
     /// Helper function to format a byte array into string
@@ -152,6 +196,66 @@ type
     /// <returns>The response as a string.</returns>
     class function ExecuteHttpRequest(const AUri, ARequestType, AContent: string;
       ATimeoutMS: Integer; AHeaders: THttpHeaders): string; static;
+
+    /// <summary>
+    /// Formats the current date as ISO 8601 timestamp
+    /// </summary>
+    /// <returns>An ISO 8601 formatted string representation
+    /// of the current date and time
+    /// </returns>
+    class function FormattedCurrentTimestampRFC822: string;
+
+    /// <summary>
+    /// Gets the RFC822 formatted timestamp that is minutesFromNow
+    /// in the future.
+    /// </summary>
+    /// <param name="minutesFromNow">The number of minutes from the current instant
+    /// for which the timestamp is needed.</param>
+    /// <returns>The ISO8601 formatted future timestamp.</returns>
+    class function GetFormattedTimestampRFC822(MinutesFromNow: Integer): string;
+
+    /// <summary>
+    /// Returns DateTime.UtcNow + ManualClockCorrection when
+    /// <seealso cref="TAWSConfigs.ManualClockCorrection"/> is set.
+    /// This value should be used instead of DateTime.UtcNow to factor in manual clock correction
+    /// </summary>
+    class function CorrectedUtcNow: TDateTime;
+
+    /// <summary>
+    /// Generates an MD5 Digest for the string-based content
+    /// </summary>
+    /// <param name="content">The content for which the MD5 Digest needs
+    /// to be computed.
+    /// </param>
+    /// <param name="fBase64Encode">Whether the returned checksum should be
+    /// base64 encoded.
+    /// </param>
+    /// <returns>A string representation of the hash with or w/o base64 encoding
+    /// </returns>
+    class function GenerateChecksumForContent(const Content: string; Base64Encode: Boolean): string; static;
+
+    /// <summary>
+    /// Generates an MD5 Digest for the stream specified
+    /// </summary>
+    /// <param name="Input">The Stream for which the MD5 Digest needs
+    /// to be computed.</param>
+    /// <returns>A string representation of the hash with base64 encoding
+    /// </returns>
+    class function GenerateMD5ChecksumForStream(Input: TStream): string; static;
+
+    /// <summary>
+    /// Convert a hex string to bytes
+    /// </summary>
+    /// <param name="Hex">Hexadecimal string</param>
+    /// <returns>Byte array corresponding to the hex string.</returns>
+    class function HexStringToBytes(const Hex: string): TArray<Byte>; static;
+
+    /// <summary>
+    /// Convert bytes to a hex string
+    /// </summary>
+    /// <param name="Value">Bytes to convert.</param>
+    /// <returns>Hexadecimal string representing the byte array.</returns>
+    class function BytesToHexString(const Value: TArray<Byte>): string; static;
   end;
 
   THeaderKeys = class
@@ -247,11 +351,9 @@ type
 implementation
 
 uses
-  Sparkle.Utils,
+  AWS.Configs,
   AWS.Internal.RegionFinder,
-  Sparkle.Http.Client,
-  AWS.Internal.SDKUtils,
-  AWS.Runtime.HttpRequestMessageFactory;
+  AWS.Internal.SDKUtils;
 
 { TProfileIniFile }
 
@@ -374,6 +476,11 @@ begin
 
 end;
 
+class function TAWSSDKUtils.BytesToHexString(const Value: TArray<Byte>): string;
+begin
+  Result := ToHex(Value, False);
+end;
+
 class function TAWSSDKUtils.CanonicalizeResourcePath(AEndpoint: IUri; const AResourcePath: string): string;
 begin
   Result := CanonicalizeResourcePath(AEndpoint, AResourcePath, False, nil, DefaultMarshallerVersion);
@@ -409,9 +516,56 @@ begin
   Result := Result + Copy(AData, Start, Index - Start + 1);
 end;
 
+class procedure TAWSSDKUtils.CopyStream(Source, Dest: TStream; const BufferSize: Integer);
+var
+  Buffer: TArray<Byte>;
+  BytesRead: Integer;
+begin
+  SetLength(Buffer, BufferSize);
+  repeat
+    BytesRead := Source.Read(Buffer[0], BufferSize);
+    if BytesRead = 0 then Exit;
+    Dest.Write(Buffer[0], BytesRead);
+  until False;
+end;
+
+class procedure TAWSSDKUtils.CopyStream(Source, Dest: TStream);
+begin
+  CopyStream(Source, Dest, DefaultBufferSize);
+end;
+
+class function TAWSSDKUtils.CorrectedUtcNow: TDateTime;
+begin
+  var localNow := TAWSConfigs.UtcNowSource();
+  if TAWSConfigs.ManualClockCorrection.HasValue then
+    localNow := localNow + TAWSConfigs.ManualClockCorrection.Value;
+  Result := localNow;
+end;
+
 class constructor TAWSSDKUtils.Create;
 begin
   FUserAgent := TInternalSDKUtils.BuildUserAgentString('');
+  FRFC822FormatSettings := TFormatSettings.Create;
+  FRFC822FormatSettings.ShortDateFormat := 'dd mmm yyyy';
+  FRFCEncodingSchemes := TDictionary<Integer, string>.Create;
+  FRFCEncodingSchemes.Add(3986, ValidUrlCharacters);
+  FRFCEncodingSchemes.Add(1738, ValidUrlCharactersRFC1738);
+  FValidPathCharacters := DetermineValidPathCharacters;
+end;
+
+type
+  TPacket = packed record
+    a: array[0..3] of Byte;
+  end;
+
+class function TAWSSDKUtils.DecodeBase64(const Input: string): TArray<Byte>;
+begin
+  Result := AWS.Lib.Utils.DecodeBase64(Input);
+end;
+
+class destructor TAWSSDKUtils.Destroy;
+begin
+  FRFCEncodingSchemes.Free;
 end;
 
 class function TAWSSDKUtils.DetermineRegion(AUrl: string): string;
@@ -455,16 +609,39 @@ begin
     Result := 'service';
 end;
 
+class function TAWSSDKUtils.DetermineValidPathCharacters: string;
+const
+  BasePathCharacters = '/:''()!*[]$';
+begin
+  Result := BasePathCharacters;
+//  Result := '';
+//  for var C in BasePathCharacters do
+//  begin
+//    var escaped := Uri.EscapeUriString(C);
+//    if (escaped.Length = 1) and (escaped[1] = C) then
+//      Result := Result + C;
+//  end;
+end;
+
+class function TAWSSDKUtils.EncodeBase64(const Input: TArray<Byte>): string;
+begin
+  Result := AWS.Lib.Utils.EncodeBase64(Input);
+end;
+
 class function TAWSSDKUtils.ExecuteHttpRequest(const AUri, ARequestType, AContent: string; ATimeoutMS: Integer;
   AHeaders: THttpHeaders): string;
+{$IFDEF USE_SPARKLE}
 var
   Client: THttpClient;
   Request: THttpRequest;
   Response: THttpResponse;
   HeaderInfo: THttpHeaderInfo;
 begin
-  Client := THttpRequestMessageFactory.CreateHttpClient(nil);
+  Client := THttpClient.Create;
   try
+{$IFDEF MSWINDOWS}
+    TWinHttpEngine(Client.Engine).ProxyMode := THttpProxyMode.Auto;
+{$ENDIF}
     // Create the request
     Request := Client.CreateRequest;
     try
@@ -496,6 +673,112 @@ begin
     Client.Free;
   end;
 end;
+{$ELSE}
+var
+  Client: THttpClient;
+  Request: IHttpRequest;
+  Response: IHttpResponse;
+  HeaderInfo: THttpHeaderInfo;
+begin
+  Client := THttpClient.Create;
+  try
+    // Create the request
+    Request := Client.GetRequest(ARequestType, AUri);
+    if ATimeoutMS > 0 then
+    begin
+      Client.ConnectionTimeout := ATimeoutMS;
+      Client.ResponseTimeout := ATimeoutMS;
+{$IFDEF DELPHISYDNEY_LVL}
+      Client.SendTimeout := ATimeoutMS;
+{$ENDIF}
+    end;
+    Request.SetHeaderValue(THeaderKeys.UserAgentHeader, FUserAgent);
+    for HeaderInfo in AHeaders.AllHeaders do
+      Request.SetHeaderValue(HeaderInfo.Name, HeaderInfo.Value);
+
+    // Build the request
+    if AContent <> '' then
+      Request.SourceStream := TBytesStream.Create(TEncoding.UTF8.GetBytes(AContent));
+    // Get response
+    try
+      Response := Client.Execute(Request);
+      if Response.StatusCode >= 400 then
+        raise EWebException.Create(AUri, Response.StatusCode);
+      Result := TEncoding.UTF8.GetString(StreamToBytes(Response.ContentStream));
+    finally
+{$IFNDEF AUTOREFCOUNT}
+      Request.SourceStream.Free;
+{$ENDIF}
+    end;
+  finally
+    Client.Free;
+  end;
+end;
+{$ENDIF}
+
+class function TAWSSDKUtils.FormattedCurrentTimestampRFC822: string;
+begin
+  Result := GetFormattedTimestampRFC822(0);
+end;
+
+class function TAWSSDKUtils.GenerateChecksumForContent(const Content: string; Base64Encode: Boolean): string;
+begin
+  // Convert the input string to a byte array and compute the hash.
+  var hashed := TCryptoUtilFactory.CryptoInstance.ComputeMD5Hash(TEncoding.UTF8.GetBytes(Content));
+
+ if Base64Encode then
+   // Convert the hash to a Base64 Encoded string and return it
+   Result := TAWSSDKUtils.EncodeBase64(hashed)
+ else
+   Result := TCryptoUtilFactory.CryptoInstance.HashAsString(hashed, True);
+end;
+
+class function TAWSSDKUtils.GenerateMD5ChecksumForStream(Input: TStream): string;
+begin
+//  string hash = null;
+
+  if not CanSeek(Input) then
+    raise EInvalidOpException.Create('Input stream must be seekable');
+
+  // Use an MD5 instance to compute the hash for the stream
+  var hashed := TCryptoUtilFactory.CryptoInstance.ComputeMD5Hash(Input);
+
+  // Convert the hash to a Base64 Encoded string and return it
+  Result := TAWSSDKUtils.EncodeBase64(hashed);
+
+  // Now that the hash has been generated, reset the stream to its origin so that the stream's data can be processed
+  Input.Position := 0;
+end;
+
+class function TAWSSDKUtils.GetExtension(const Path: string): string;
+begin
+  if Path = '' then Exit('');
+  var length := Path.Length;
+  var index := length - 1;
+
+  while index >= 0 do
+  begin
+    var ch := path.Chars[index];
+    if ch = '.' then
+    begin
+      if index <> length - 1 then
+        Exit(path.Substring(index, length - index))
+      else
+        Exit('');
+    end
+    else
+    if (ch = '\') or (ch = '/') or (ch = ':') then
+      Break;
+    Dec(index);
+  end;
+  Result := '';
+end;
+
+class function TAWSSDKUtils.GetFormattedTimestampRFC822(MinutesFromNow: Integer): string;
+begin
+  var dateTime := IncMinute(TAWSSDKUtils.CorrectedUtcNow, minutesFromNow);
+  Result := FormatDateTime(TAWSSDKUtils.RFC822DateFormat, dateTime);
+end;
 
 class function TAWSSDKUtils.GetParametersAsString(AParameterCollection: TParameterCollection): string;
 var
@@ -507,10 +790,27 @@ begin
   SortedParameters := AParameterCollection.GetSortedParametersList;
   for Kvp in SortedParameters do
     if Kvp.Value <> '' then
-      Data := Data + Kvp.Key + '=' + TSparkleUtils.PercentEncode(Kvp.Value) + '&';
+      Data := Data + Kvp.Key + '=' + AWS.Lib.Utils.PercentEncode(Kvp.Value) + '&';
   if Data <> '' then
     Delete(Data, Length(Data), 1);
   Result := Data;
+end;
+
+class function TAWSSDKUtils.HexStringToBytes(const Hex: string): TArray<Byte>;
+begin
+  if string.IsNullOrEmpty(Hex) or ((Hex.Length mod 2) = 1) then
+    raise EArgumentOutOfRangeException.Create('hex');
+
+  var count := 0;
+  SetLength(Result, Hex.Length div 2);
+  var I := 0;
+  while i < Hex.Length do
+  begin
+    var sub := Hex.Substring(I, 2);
+    Result[Count] := Byte(StrToInt('$' + sub));
+    Inc(count);
+    Inc(I, 2);
+  end;
 end;
 
 class function TAWSSDKUtils.JoinResourcePathSegments(APathSegments: TArray<string>; APath: Boolean): string;
@@ -521,7 +821,7 @@ begin
   Result := '';
   for PathSegment in APathSegments do
   begin
-    Segment := TSparkleUtils.PercentEncode(PathSegment);
+    Segment := AWS.Lib.Utils.PercentEncode(PathSegment);
     if APath then
       Segment := StringReplace(Segment, '/', '%2F', [rfReplaceAll]);
     Result := Result + Segment + '/';
@@ -537,6 +837,23 @@ begin
   else
     Result := JoinResourcePathSegments(
       SplitResourcePathIntoSegments(AResourcePath, APathResources), True);
+end;
+
+class function TAWSSDKUtils.Rfc822ToDateTime(const S: string): TDateTime;
+begin
+  if not TryRfc822ToDateTime(S, Result) then
+    raise EConvertError.CreateFmt('Invalid RFC822 date format: "%s"', [S]);
+end;
+
+class function TAWSSDKUtils.SecondsBetween(const ANow, AThen: TDateTime): Int64;
+begin
+  // Different from regular Delphi version, this one returns negative numbers if ANow is lower then AThen.
+  Result := (DateTimeToMilliseconds(ANow) - DateTimeToMilliseconds(AThen)) div (MSecsPerSec);
+end;
+
+class procedure TAWSSDKUtils.Sleep(MS: Integer);
+begin
+  System.SysUtils.Sleep(MS);
 end;
 
 class function TAWSSDKUtils.SplitResourcePathIntoSegments(const AResourcePath: string;
@@ -572,6 +889,31 @@ begin
   end;
 end;
 
+class function TAWSSDKUtils.StreamToBytes(Source: TStream): TArray<Byte>;
+var
+  BytesStream: TBytesStream;
+begin
+  BytesStream := TBytesStream.Create;
+  try
+    CopyStream(Source, BytesStream);
+    Result := Copy(BytesStream.Bytes, 0, BytesStream.Size);
+  finally
+    BytesStream.Free;
+  end;
+end;
+
+class function TAWSSDKUtils.StreamToString(Source: TStream; Encoding: TEncoding): string;
+begin
+  if Encoding = nil then
+    Encoding := TEncoding.UTF8;
+  var Reader := TStreamReader.Create(Source, Encoding, False);
+  try
+    Result := Reader.ReadToEnd;
+  finally
+    Reader.Free;
+  end;
+end;
+
 type
   TB2HArray = array[0..15] of Byte;
 
@@ -598,10 +940,40 @@ begin
   end;
 end;
 
+class function TAWSSDKUtils.TryRfc822ToDateTime(const S: string; var D: TDateTime): Boolean;
+begin
+  var Len := Length(S);
+  if Len <> 29 then Exit(False);
+  if S[4] <> ',' then Exit(False);
+  if not S.EndsWith(' GMT') then Exit(False);
+  Result := TryStrToDateTime(Copy(S, 5, 20), D, FRFC822FormatSettings);
+  if Result then
+    D := TTimeZone.Local.ToLocalTime(D);
+end;
+
 class function TAWSSDKUtils.UrlEncode(const AData: string; APath: Boolean): string;
 begin
-  {TODO: Review if this is enough}
-  Result := TSparkleUtils.PercentEncode(AData);
+  Result := UrlEncode(3986, AData, APath);
+end;
+
+class function TAWSSDKUtils.UrlEncode(RfcNumber: integer; const Data: string; Path: Boolean): string;
+begin
+  Result := '';
+  var validChars: string;
+  if not FRFCEncodingSchemes.TryGetValue(RfcNumber, validChars) then
+    validChars := ValidUrlCharacters;
+
+  var unreservedChars := validChars;
+  if Path then
+    unreservedChars := unreservedChars + FValidPathCharacters;
+
+  for var symbol in TEncoding.UTF8.GetBytes(Data) do
+  begin
+    if unreservedChars.IndexOf(Chr(symbol)) <> -1 then
+      Result := Result + Chr(symbol)
+    else
+      Result := Result + '%' + IntToHex(Symbol, 2);
+  end;
 end;
 
 class function TAWSSDKUtils.UrlEncodeSlash(const Value: string): string;

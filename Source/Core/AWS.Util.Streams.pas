@@ -15,7 +15,6 @@ type
     FOwnsStream: Boolean;
   strict protected
     property BaseStream: TStream read FBaseStream;
-    property OwnsStream: Boolean read FOwnsStream write FOwnsStream;
   protected
     { TStream overrides }
     function GetSize: Int64; override;
@@ -30,8 +29,11 @@ type
     constructor Create(ABaseStream: TStream; AOwnsStream: Boolean);
     destructor Destroy; override;
     function CanSeek: Boolean; virtual;
+    function HasLength: Boolean; virtual;
     function SearchWrappedStream(ACondition: TFunc<TStream, Boolean>): TStream; overload;
-    function GetNonWrapperBaseStream: TStream; overload;
+    function GetNonWrapperBaseStream(UnmanageStream: Boolean = False): TStream; overload;
+    function GetSeekableBaseStream: TStream;
+    property OwnsStream: Boolean read FOwnsStream write FOwnsStream;
     class function SearchWrappedStream(AStream: TStream; ACondition: TFunc<TStream, Boolean>): TStream; overload; static;
     class function GetNonWrapperBaseStream(AStream: TStream): TStream; overload; static;
   end;
@@ -65,7 +67,8 @@ function CanSeek(S: TStream): Boolean;
 implementation
 
 uses
-  System.Math;
+  System.Math,
+  AWS.Util.PartialWrapperStream;
 
 type
   TInternalStream = class(TStream)
@@ -115,25 +118,54 @@ begin
     Result := AStream;
 end;
 
-function TWrapperStream.GetNonWrapperBaseStream: TStream;
+function TWrapperStream.GetNonWrapperBaseStream(UnmanageStream: Boolean = False): TStream;
 var
   BaseStream: TStream;
-//  PartialStream: TPartialWrapperStream;
+  ParentStream: TWrapperStream;
 begin
   BaseStream := Self;
+  ParentStream := nil;
   repeat
-    {TODO: Uncomment this when TPartialWrapperStream is implemented}
-//    if BaseStream is TPartialWrapperStream then
-//      Exit(BaseStream);
+    if BaseStream is TPartialWrapperStream then
+    begin
+      if UnmanageStream and (ParentStream <> nil) then
+        ParentStream.OwnsStream := False;
+      Exit(BaseStream);
+    end;
 
-    BaseStream := TWrapperStream(BaseStream).BaseStream;
+    ParentStream := TWrapperStream(BaseStream);
+    BaseStream := ParentStream.BaseStream;
   until not (BaseStream is TWrapperStream);
+
+  if UnmanageStream and (ParentStream <> nil) then
+    ParentStream.OwnsStream := False;
   Result := BaseStream;
+end;
+
+function TWrapperStream.GetSeekableBaseStream: TStream;
+begin
+  var baseStream: TStream := Self;
+  repeat
+    if AWS.Util.Streams.CanSeek(baseStream) then
+      Exit(baseStream);
+
+    baseStream := (baseStream as TWrapperStream).BaseStream;
+  until not (baseStream is TWrapperStream);
+
+  if not AWS.Util.Streams.CanSeek(baseStream) then
+    raise EInvalidOpException.Create('Unable to find seekable stream');
+
+  Result := baseStream;
 end;
 
 function TWrapperStream.GetSize: Int64;
 begin
   Result := TInternalStream(BaseStream).GetSize;
+end;
+
+function TWrapperStream.HasLength: Boolean;
+begin
+  Result := True;
 end;
 
 function TWrapperStream.Read(var Buffer; Count: Longint): Longint;

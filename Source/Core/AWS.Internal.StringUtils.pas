@@ -3,8 +3,8 @@ unit AWS.Internal.StringUtils;
 interface
 
 uses
-  Bcl.Types.Nullable, System.SysUtils, System.DateUtils,
-  System.Classes;
+  System.SysUtils, System.DateUtils, System.Classes,
+  AWS.Nullable;
 
 type
   TStringUtils = class
@@ -21,7 +21,7 @@ type
     class function FromInt64(const Value: Int64): string; static;
     class function FromBoolean(const Value: Boolean): string; static;
     class function FromDateTimeToISO8601(const Value: TDateTime): string; static;
-//    class function FromDateTimeToRFC822(const Value: TDateTime): string; static;
+    class function FromDateTimeToRFC822(const Value: TDateTime): string; static;
 //    class function FromDateTimeToUnixTimestamp(const Value: TDateTime): string; static;
     class function FromDouble(const Value: Double): string; static;
 //    class function FromDecimal(const Value: Double): string; static;
@@ -31,7 +31,6 @@ type
 implementation
 
 uses
-  Bcl.Utils,
   AWS.SDKUtils;
 
 { TStringUtils }
@@ -52,8 +51,12 @@ end;
 
 class function TStringUtils.FromDateTimeToISO8601(const Value: TDateTime): string;
 begin
-  Result := FormatDateTime(TAWSSDKUtils.ISO8601DateFormat,
-    TTimeZone.Local.ToUniversalTime(Value));
+  Result := FormatDateTime(TAWSSDKUtils.ISO8601DateFormat, TTimeZone.Local.ToUniversalTime(Value));
+end;
+
+class function TStringUtils.FromDateTimeToRFC822(const Value: TDateTime): string;
+begin
+  Result := FormatDateTime(TAWSSDKUtils.RFC822DateFormat, TTimeZone.Local.ToUniversalTime(Value));
 end;
 
 class function TStringUtils.FromDouble(const Value: Double): string;
@@ -83,7 +86,7 @@ end;
 
 class function TStringUtils.FromTBytesStream(const Value: TBytesStream): string;
 begin
-  Result := TBclUtils.EncodeBase64(Copy(Value.Bytes, 0, Value.Size));
+  Result := TAWSSDKUtils.EncodeBase64(Copy(Value.Bytes, 0, Value.Size));
 end;
 
 //class function TStringUtils.FromTMemoryStream(const Value: TMemoryStream): string;

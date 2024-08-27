@@ -5,11 +5,13 @@ unit AWS.Runtime.Credentials;
 interface
 
 uses
-  System.Generics.Collections, System.SysUtils, System.Classes,
-  Bcl.Logging,
+  System.Generics.Collections, System.SysUtils, System.Classes, System.TypInfo,
+  AWS.Enums,
+  AWS.Lib.Logging,
+  AWS.Lib.Timer,
+  AWS.Nullable,
   AWS.SDKUtils,
-  AWS.RegionEndpoint,
-  Sparkle.Sys.Timer;
+  AWS.RegionEndpoint;
 
 type
   TCredentialProfile = class;
@@ -224,7 +226,7 @@ type
     class function FetchCredentials: IImmutableCredentials; static;
   strict private
     FLogger: ILogger;
-    FCredentialsRetrieverTimer: TSparkleTimer;
+    FCredentialsRetrieverTimer: TAWSTimer;
     FLastRetrievedCredentials: IImmutableCredentials;
     FCredentialsLock: TObject;
     procedure RenewCredentials(Unused: TObject);
@@ -279,6 +281,11 @@ type
     FName: string;
     FOptions: TCredentialProfileOptions;
     FRegion: IRegionEndpointEx;
+    FS3UseArnRegion: NullableBoolean;
+    FS3RegionalEndpoint: Nullable<TS3UsEast1RegionalEndpointValue>;
+    FEndpointDiscoveryEnabled: Nullable<Boolean>;
+    FMaxAttempts: Nullable<Integer>;
+    FRetryMode: Nullable<TRequestRetryMode>;
     function GetProfileType: TCredentialProfileType;
   private
     function GetAWSCredentials(AProfileSource: ICredentialProfileSource; ANonCallBackOnly: Boolean): IAWSCredentials;
@@ -287,8 +294,39 @@ type
     constructor Create;
     destructor Destroy; override;
     property Name: string read FName;
+
+    /// <summary>
+    /// The options to be used to create AWSCredentials.
+    /// </summary>
     property Options: TCredentialProfileOptions read FOptions;
+
+    /// <summary>
+    /// The region to be used with this CredentialProfile
+    /// </summary>
     property Region: IRegionEndpointEx read FRegion write FRegion;
+
+    /// <summary>
+    /// If true the region identified in the S3 access point arn will be used when making requests.
+    /// </summary>
+    property S3UseArnRegion: NullableBoolean read FS3UseArnRegion write FS3UseArnRegion;
+
+    property S3RegionalEndpoint: Nullable<TS3UsEast1RegionalEndpointValue> read FS3RegionalEndpoint write FS3RegionalEndpoint;
+
+    /// <summary>
+    /// The endpoint discovery enabled value for this CredentialProfile
+    /// </summary>
+    property EndpointDiscoveryEnabled: Nullable<Boolean> read FEndpointDiscoveryEnabled write FEndpointDiscoveryEnabled;
+
+    /// <summary>
+    /// The request retry mode  as legacy, standard, or adaptive
+    /// </summary>
+    property RetryMode: Nullable<TRequestRetryMode> read FRetryMode write FRetryMode;
+
+    /// <summary>
+    /// Specified how many HTTP requests an SDK should make for a single
+    /// SDK operation invocation before giving up.
+    /// </summary>
+    property MaxAttempts: Nullable<Integer> read FMaxAttempts write FMaxAttempts;
   end;
 
   ICredentialProfileStore = interface(ICredentialProfileSource)
@@ -340,10 +378,10 @@ type
     // Reserved words
 //    const ToolkitArtifactGuidField = 'toolkit_artifact_guid';
     const RegionField = 'region';
-//    const EndpointDiscoveryEnabledField = 'endpoint_discovery_enabled';
+    const EndpointDiscoveryEnabledField = 'endpoint_discovery_enabled';
 //    const CredentialProcess = 'credential_process';
 //    const StsRegionalEndpointsField = 'sts_regional_endpoints';
-//    const S3UseArnRegionField = 's3_use_arn_region';
+    const S3UseArnRegionField = 's3_use_arn_region';
 //    const S3RegionalEndpointField = 's3_us_east_1_regional_endpoint';
     const RetryModeField = 'retry_mode';
     const MaxAttemptsField = 'max_attempts';
@@ -503,10 +541,17 @@ begin
 
   if FCachedCredentials = nil then
   begin
+    {Todo: review fallback to anonymous}
 //    if AFallbackToAnonymous then
 //      Exit(TAnonymousAWSCredentials.Create);
 
-    raise EAmazonServiceException.Create('Unable to find credentials');
+    var ErrorMessage := 'Unable to find credentials';
+    for var I := 0 to Length(Errors) - 1 do
+      ErrorMessage := ErrorMessage + Format('%s%sException %d of %d:%s%s',
+        [sLineBreak, sLineBreak, I + 1, Length(Errors), sLineBreak, Errors[I]]);
+    if Length(Errors) = 0 then
+      ErrorMessage := ErrorMessage + sLineBreak + 'No exceptions to report';
+    raise EAmazonServiceException.Create(ErrorMessage);
   end;
 
   Result := FCachedCredentials;
@@ -663,26 +708,74 @@ begin
     try
       if TryGetSection(AProfileName, ProfileDictionary) then
       begin
-        {TODO: This is a different implementation from original, which was overengineered.
-         But pay attention to manually add the missing properties when they are needed}
+        begin
+          {TODO: This is a different implementation from original, which was overengineered.
+           But pay attention to manually add the missing properties when they are needed}
+          TempProfile.Options.AccessKey := ProfileDictionary.Values[AccessKeyField];
+          TempProfile.Options.SecretKey := ProfileDictionary.Values[SecretKeyField];
+        end;
 
-        TempProfile.Options.AccessKey := ProfileDictionary.Values[AccessKeyField];
-        TempProfile.Options.SecretKey := ProfileDictionary.Values[SecretKeyField];
+        // toolkitArtifactGuid
 
         Region := nil;
         TempValue := ProfileDictionary.Values[RegionField];
         if TempValue <> '' then
           Region := TRegionEndpoint.GetBySystemName(TempValue);
 
-        // toolkitArtifactGuid
-        // EndPointDiscoveryEnabled
+        var endpointDiscoveryEnabledString: string := ProfileDictionary.Values[EndpointDiscoveryEnabledField];
+        var endpointDiscoveryEnabled: Nullable<Boolean> := Nullable<Boolean>.Empty;
+        if endpointDiscoveryEnabledString <> '' then
+        begin
+          var endpointDiscoveryEnabledOut: Boolean;
+          if not TryStrToBool(endpointDiscoveryEnabledString, endpointDiscoveryEnabledOut) then
+          begin
+            FLogger.Info(Format('Invalid value %s for %s in profile %s. A boolean true/false is expected.',
+              [endpointDiscoveryEnabledString, EndpointDiscoveryEnabledField, AProfileName]));
+            AProfile := nil;
+            Exit(False);
+          end;
+          endpointDiscoveryEnabled := endpointDiscoveryEnabledOut;
+        end;
+
         // stsRegionalEndpoints
         // s3UseArnRegionString
         // s3RegionalEndpoint
-        // requestRetryMode
-        // maxAttempts
+
+        var requestRetryMode: Nullable<TRequestRetryMode> := Nullable<TRequestRetryMode>.Empty;
+        var retryModeString: string := ProfileDictionary.Values[RetryModeField];
+        if retryModeString <> '' then
+        begin
+          var retryModeInt := GetEnumValue(TypeInfo(TRequestRetryMode), retryModeString);
+          if retryModeInt < 0 then
+          begin
+            FLogger.Info(Format('Invalid value %s for %s in profile %s. A string legacy/standard/adaptive is expected.',
+              [retryModeString, RetryModeField, AProfileName]));
+            AProfile := nil;
+            Exit(False);
+          end;
+          requestRetryMode := TRequestRetryMode(retryModeInt);
+        end;
+
+        var maxAttempts: Nullable<Integer> := Nullable<Integer>.Empty;
+        var maxAttemptsString := ProfileDictionary.Values[MaxAttemptsField];
+        if maxAttemptsString <> '' then
+        begin
+          var maxAttemptsTemp: Integer;
+          if not TryStrToInt(maxAttemptsString, maxAttemptsTemp) or (maxAttemptsTemp <= 0) then
+          begin
+            FLogger.Info(Format('Invalid value %s for %s in profile %s. A positive integer is expected.',
+              [maxAttemptsString, MaxAttemptsField, AProfileName]));
+            AProfile := nil;
+            Exit(False);
+          end;
+          maxAttempts := maxAttemptsTemp;
+        end;
 
         TempProfile.Region := Region;
+        TempProfile.EndpointDiscoveryEnabled := endpointDiscoveryEnabled;
+        TempProfile.RetryMode := requestRetryMode;
+        TempProfile.MaxAttempts := maxAttempts;
+
         if not IsSupportedProfileType(TempProfile.ProfileType) then
         begin
           FLogger.Info(Format('The profile type %d is not supported by SharedCredentialsFile.', [Ord(TempProfile.ProfileType)]));
@@ -1015,7 +1108,7 @@ begin
   {TODO: Replace this by a ReadWriterLock later}
   FCredentialsLock := TObject.Create;
   FLogger := LogManager.GetLogger(TDefaultInstanceProfileAWSCredentials);
-  FCredentialsRetrieverTimer := TSparkleTimer.Create(RenewCredentials, nil, 1, TTimerType.SingleShot);
+  FCredentialsRetrieverTimer := TAWSTimer.Create(RenewCredentials, nil, 1, TTimerType.SingleShot);
 end;
 
 destructor TDefaultInstanceProfileAWSCredentials.Destroy;

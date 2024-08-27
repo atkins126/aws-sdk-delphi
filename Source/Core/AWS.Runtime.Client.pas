@@ -6,12 +6,16 @@ interface
 
 uses
   System.Generics.Collections, System.SysUtils, System.StrUtils,
-  Bcl.Logging,
+  AWS.Lib.Logging,
+  AWS.Enums,
   AWS.Runtime.Model,
   AWS.Runtime.Credentials,
   AWS.Internal.ServiceMetadata,
   AWS.Internal.RuntimePipeline,
   AWS.Runtime.ClientConfig,
+  AWS.Runtime.Contexts,
+  AWS.Runtime.ExceptionEvent,
+  AWS.Runtime.RetryPolicy,
   AWS.Internal.Request,
   AWS.Runtime.IHttpRequestFactory,
   AWS.Auth.Signer,
@@ -38,9 +42,12 @@ type
     FSigner: TAbstractAWSSigner;
     FServiceMetadata: IServiceMetadata;
     FRuntimePipeline: TRuntimePipeline;
+    FOnException: TExceptionEventHandler;
     function GetConfig: IClientConfig;
     procedure BuildRuntimePipeline;
-  strict protected
+  protected
+    procedure ProcessExceptionHandlers(AExecutionContext: TExecutionContext; AException: Exception); virtual;
+  protected
     procedure Initialize; virtual;
     function Invoke<TResponse: TAmazonWebServiceResponse>(ARequest: TAmazonWebServiceRequest;
       AOptions: TInvokeOptionsBase): TResponse;
@@ -66,20 +73,34 @@ type
     /// A readonly view of the configuration for the service client.
     /// </summary>
     property Config: IClientConfig read GetConfig;
+
+    /// <summary>
+    /// Occurs after an exception is encountered.
+    /// </summary>
+    property OnException: TExceptionEventHandler read FOnException write FOnException;
   end;
 
 implementation
 
 uses
-  AWS.Runtime.Contexts,
   AWS.Internal.PipelineHandler,
   AWS.SDKUtils,
+{$IFDEF USE_SPARKLE}
+  AWS.Runtime.SparkleHttpRequestMessageFactory,
+{$ELSE}
   AWS.Runtime.HttpRequestMessageFactory,
+{$ENDIF}
+  AWS.Internal.StandardRetryPolicy,
+  AWS.Internal.AdaptiveRetryPolicy,
+  AWS.Internal.DefaultRetryPolicy,
+
   AWS.Pipeline.HttpHandler,
   AWS.Pipeline.Marshaller,
   AWS.Pipeline.EndpointResolver,
+  AWS.Pipeline.ErrorCallbackHandler,
   AWS.Pipeline.ErrorHandler,
   AWS.Pipeline.CredentialsRetriever,
+  AWS.Pipeline.RetryHandler,
   AWS.Pipeline.Signer,
   AWS.Pipeline.Unmarshaller;
 
@@ -90,12 +111,17 @@ var
   HttpRequestFactory: IHttpRequestFactory;
   HttpHandler: IPipelineHandler;
 begin
+{$IFDEF USE_SPARKLE}
+  HttpRequestFactory := TSparkleHttpRequestMessageFactory.Create(Config);
+{$ELSE}
   HttpRequestFactory := THttpRequestMessageFactory.Create(Config);
-  HttpHandler := TSparkleHttpHandler.Create(HttpRequestFactory, Self);
+{$ENDIF}
+  HttpHandler := THttpHandler.Create(HttpRequestFactory, Self);
 
   {TODO: Pre and post events not implemented}
 
-  {TODO: RetryPolicy}
+  var ErrorCallbackHandler := TErrorCallbackHandler.Create;
+  ErrorCallbackHandler.OnError := ProcessExceptionHandlers;
 
   // Build default runtime pipeline.
   {TODO: Several handlers not implemented}
@@ -107,12 +133,28 @@ begin
   FRuntimePipeline.AddHandler(TSigner.Create);
 //  FRuntimePipeline.AddHandler(TEndpoingDiscoveryHandler.Create);
   FRuntimePipeline.AddHandler(TCredentialsRetriever.Create(Credentials));
-//  FRuntimePipeline.AddHandler(TRetryHandler.Create(RetryPolicy));
+
+  // Retry policy
+  begin
+    var retryPolicy: TRetryPolicy;
+    case Config.RetryMode of
+      TRequestRetryMode.Adaptive:
+        retryPolicy := TAdaptiveRetryPolicy.Create(Config);
+      TRequestRetryMode.Standard:
+        retryPolicy := TStandardRetryPolicy.Create(Config);
+      TRequestRetryMode.Legacy:
+        retryPolicy := TDefaultRetryPolicy.Create(Config);
+    else
+      raise EInvalidOpException.Create('Unknown retry mode');
+    end;
+    FRuntimePipeline.AddHandler(TRetryHandler.Create(retryPolicy, True));
+  end;
+
 //  FRuntimePipeline.AddHandler(PostMarshallHandler);
   FRuntimePipeline.AddHandler(TEndpointResolver.Create);
   FRuntimePipeline.AddHandler(TMarshaller.Create);
 //  FRuntimePipeline.AddHandler(PreMarshallHandler);
-//  FRuntimePipeline.AddHandler(ErrorCallbackHandler);
+  FRuntimePipeline.AddHandler(ErrorCallbackHandler);
 //  FRuntimePipeline.AddHandler(TMetricsHandler);
 
   {TODO: CSM Configuration}
@@ -250,6 +292,19 @@ begin
     end;
   finally
     RequestContext.Free;
+  end;
+end;
+
+procedure TAmazonServiceClient.ProcessExceptionHandlers(AExecutionContext: TExecutionContext; AException: Exception);
+begin
+  if not Assigned(FOnException) then
+    Exit;
+
+  var args := TWebServiceExceptionEventArgs.Create(AException, AExecutionContext.RequestContext.Request);
+  try
+    FOnException(Self, args);
+  finally
+    args.Free;
   end;
 end;
 

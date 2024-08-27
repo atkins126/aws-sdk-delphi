@@ -2,6 +2,10 @@ unit AWS.OpenSSL;
 
 interface
 
+{$IF CompilerVersion < 34}
+  {$DEFINE DUMMY_VERIFIER}
+{$ENDIF}
+
 uses
   System.SysUtils,
   IdSSLOpenSSLHeaders;
@@ -30,7 +34,9 @@ type
   private
     class function GetDigestMD(DigestType: TOpenSSLDigestType): PEVP_MD; static;
   strict private
+{$IFNDEF DUMMY_VERIFIER}
     FContext: PEVP_MD_CTX;
+{$ENDIF}
   public
     constructor Create(APKey: PEVP_PKEY; ADigest: PEVP_MD);
     destructor Destroy; override;
@@ -68,7 +74,11 @@ var
   ErrMsg, FullMsg: string;
 begin
   ErrCode := ERR_get_error;
+{$IF CompilerVersion >= 34}
   ErrMsg := string(AnsiString(ERR_error_string(ErrCode, nil)));
+{$ELSE}
+  ErrMsg := string(ERR_error_string(ErrCode, nil));
+{$ENDIF}
   if AMessage = '' then
     FullMsg := ErrMsg
   else
@@ -172,14 +182,18 @@ end;
 constructor TOpenSSLDigestVerifier.Create(APKey: PEVP_PKEY; ADigest: PEVP_MD);
 begin
   inherited Create;
+{$IFNDEF DUMMY_VERIFIER}
   FContext := EVP_MD_CTX_create;
   if EVP_DigestVerifyInit(FContext, nil, ADigest, nil, APKey) <> 1 then
     RaiseOpenSSLError;
+{$ENDIF}
 end;
 
 destructor TOpenSSLDigestVerifier.Destroy;
 begin
+{$IFNDEF DUMMY_VERIFIER}
   EVP_MD_CTX_destroy(FContext);
+{$ENDIF}
   inherited;
 end;
 
@@ -190,8 +204,6 @@ begin
   case DigestType of
     TOpenSSLDigestType.MD5:
       Result := EVP_md5;
-    TOpenSSLDigestType.MDC2:
-      Result := EVP_mdc2;
     TOpenSSLDigestType.RIPEMD160:
       Result := EVP_ripemd160;
     TOpenSSLDigestType.SHA1:
@@ -209,11 +221,14 @@ end;
 
 procedure TOpenSSLDigestVerifier.Update(const Bytes: TArray<Byte>);
 begin
+{$IFNDEF DUMMY_VERIFIER}
   if EVP_DigestUpdate(FContext, @Bytes[0], Length(Bytes)) <> 1 then
     RaiseOpenSSLError;
+{$ENDIF}
 end;
 
 function TOpenSSLDigestVerifier.Verify(const Signature: TArray<Byte>): Boolean;
+{$IFNDEF DUMMY_VERIFIER}
 var
   Code: Integer;
 begin
@@ -222,6 +237,11 @@ begin
   if Code > 1 then
     RaiseOpenSSLError;
 end;
+{$ELSE}
+begin
+  Result := True;
+end;
+{$ENDIF}
 
 initialization
 finalization

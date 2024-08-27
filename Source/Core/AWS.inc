@@ -1,3 +1,8 @@
+{$SCOPEDENUMS ON}
+{$IFDEF NEXTGEN}
+{$ZEROBASEDSTRINGS OFF}
+{$ENDIF}
+
 {$IF CompilerVersion >= 24}
   {$LEGACYIFEND ON}
 {$IFEND}
@@ -18,8 +23,12 @@
   {$DEFINE DELPHIXE3_LVL}
 {$IFEND}
 
-{$IF CompilerVersion >= 25}
+{$IF CompilerVersion >= 23}
   {$DEFINE DELPHIXE4_LVL}
+{$IFEND}
+
+{$IF CompilerVersion >= 25}
+  {$DEFINE DELPHIXE2_LVL}
 {$IFEND}
 
 {$IF CompilerVersion >= 26}
@@ -45,8 +54,22 @@
   {$DEFINE DELPHITOKYO_LVL}
 {$IFEND}
 
+{$IF CompilerVersion >= 33}
+  {$DEFINE DELPHIRIO_LVL}
+{$IFEND}
+
+{$IF CompilerVersion >= 34}
+  {$DEFINE DELPHISYDNEY_LVL}
+{$IFEND}
+
+{$IF CompilerVersion >= 35}
+  {$DEFINE DELPHI11_LVL}
+{$IFEND}
+
+{$IF CompilerVersion >= 36}
+  {$DEFINE DELPHI12_LVL}
+{$IFEND}
+
 {$IFDEF NEXTGEN}
   {$ZEROBASEDSTRINGS OFF}
 {$ENDIF}
-
-{$SCOPEDENUMS ON}

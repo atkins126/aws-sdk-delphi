@@ -5,17 +5,15 @@ unit AWS.Runtime.ClientConfig;
 interface
 
 uses
+  System.TimeSpan,
   AWS.RegionEndpoint,
+  AWS.Configs,
+  AWS.Enums,
+  AWS.Runtime.InternalConfiguration,
   AWS.SDKUtils,
-  Bcl.Types.Nullable;
+  AWS.Nullable;
 
 type
-  /// <summary>
-  /// RetryMode determines which request retry mode is used for requests that do
-  /// not complete successfully.
-  /// </summary>
-  TRequestRetryMode = (Legacy, Standard, Adaptive);
-
   /// <summary>
   /// This interface is the read only access to the ClientConfig object used when setting up service clients. Once service clients
   /// are initiated the config object should not be changed to avoid issues with using a service client in a multi threaded environment.
@@ -31,18 +29,31 @@ type
     function GetMaxErrorRetry: Integer;
     function GetReadEntireResponse: Boolean;
     function GetRegionEndpoint: IRegionEndpointEx;
+    procedure SetRegionEndpoint(const Value: IRegionEndpointEx);
     function GetRegionEndpointServiceName: string;
     function GetResignRetries: Boolean;
     function GetServiceURL: string;
     function GetSignatureMethod: TSigningAlgorithm;
     function GetSignatureVersion: string;
+    procedure SetSignatureVersion(const Value: string);
     function GetUseAlternateUserAgentHeader: Boolean;
     function GetUseDualstackEndpoint: Boolean;
     function GetUseHttp: Boolean;
     function GetUserAgent: string;
+    function GetAllowAutoRedirect: Boolean;
+    function GetRetryMode: TRequestRetryMode;
+    function GetThrottleRetries: Boolean;
+    function GetFastFailRequests: Boolean;
 
     function DetermineServiceUrl: string;
+    function CorrectedUtcNow: TDateTime;
     procedure Validate;
+
+    /// <summary>
+    /// Returns the calculated clock skew value for this config's service endpoint. If AWSConfigs.CorrectForClockSkew is false,
+    /// this value won't be used to construct service requests.
+    /// </summary>
+    function ClockOffset: TTimeSpan;
 
     property AuthenticationRegion: string read GetAuthenticationRegion;
     property AuthenticationServiceName: string read GetAuthenticationServiceName;
@@ -53,19 +64,45 @@ type
     property LogResponse: Boolean read GetLogResponse;
     property MaxErrorRetry: Integer read GetMaxErrorRetry;
     property ReadEntireResponse: Boolean read GetReadEntireResponse;
-    property RegionEndpoint: IRegionEndpointEx read GetRegionEndpoint;
+    property RegionEndpoint: IRegionEndpointEx read GetRegionEndpoint write SetRegionEndpoint;
     property RegionEndpointServiceName: string read GetRegionEndpointServiceName;
     property ResignRetries: Boolean read GetResignRetries;
     property ServiceURL: string read GetServiceURL;
     property SignatureMethod: TSigningAlgorithm read GetSignatureMethod;
-    property SignatureVersion: string read GetSignatureVersion;
+    property SignatureVersion: string read GetSignatureVersion write SetSignatureVersion;
     property UseAlternateUserAgentHeader: Boolean read GetUseAlternateUserAgentHeader;
     property UseDualstackEndpoint: Boolean read GetUseDualstackEndpoint;
     property UseHttp: Boolean read GetUseHttp;
     property UserAgent: string read GetUserAgent;
+    property AllowAutoRedirect: Boolean read GetAllowAutoRedirect;
+
+    /// <summary>
+    /// Returns the flag indicating the current mode in use for request
+    /// retries and influences the value returned from <see cref="MaxErrorRetry"/>.
+    /// The default value is RequestRetryMode.Legacy. This flag can be configured
+    /// by using the AWS_RETRY_MODE environment variable, retry_mode in the
+    /// shared configuration file, or by setting this value directly.
+    /// </summary>
+    property RetryMode: TRequestRetryMode read GetRetryMode;
+
+    /// <summary>
+    /// Configures a flag enabling to either opt in or opt out of the retry throttling service.
+    /// Note: set value to true to enable retry throttling feature. The Default value for this flag is false.
+    /// </summary>
+    property ThrottleRetries: Boolean read GetThrottleRetries;
+
+    /// <summary>
+    /// Under Adaptive retry mode, this flag determines if the client should wait for
+    /// a send token to become available or don't block and fail the request immediately
+    /// if a send token is not available.
+    /// </summary>
+    property FastFailRequests: Boolean read GetFastFailRequests;
   end;
 
   TClientConfig = class(TInterfacedObject, IClientConfig)
+  private const
+    MaxRetriesLegacyDefault = 4;
+    MaxRetriesDefault = 2;
   private
     FAuthenticationServiceName: string;
     FLogMetrics: Boolean;
@@ -84,6 +121,10 @@ type
     FSignatureVersion: string;
     FSignatureMethod: TSigningAlgorithm;
     FUseAlternateUserAgentHeader: Boolean;
+    FAllowAutoRedirect: Boolean;
+    FRetryMode: Nullable<TRequestRetryMode>;
+    FThrottleRetries: Boolean;
+    FFastFailRequests: Boolean;
     function GetLogMetrics: Boolean;
     function GetLogResponse: Boolean;
     function GetUseDualstackEndpoint: Boolean;
@@ -105,6 +146,12 @@ type
     function GetSignatureVersion: string;
     function GetSignatureMethod: TSigningAlgorithm;
     function GetUseAlternateUserAgentHeader: Boolean;
+    procedure SetSignatureVersion(const Value: string);
+    function GetAllowAutoRedirect: Boolean;
+    function GetRetryMode: TRequestRetryMode;
+    procedure SetRetryMode(const Value: TRequestRetryMode);
+    function GetThrottleRetries: Boolean;
+    function GetFastFailRequests: Boolean;
   strict protected
     function GetRegionEndpointServiceName: string; virtual; abstract;
     function GetServiceVersion: string; virtual; abstract;
@@ -118,7 +165,10 @@ type
     constructor Create; overload;
     constructor Create(ARegion: IRegionEndpointEx); overload;
     function DetermineServiceUrl: string; virtual;
+    function CorrectedUtcNow: TDateTime;
     procedure Validate; virtual;
+    function ClockOffset: TTimeSpan;
+
     property AuthenticationServiceName: string read GetAuthenticationServiceName write FAuthenticationServiceName;
     property AuthenticationRegion: string read GetAuthenticationRegion write FAuthenticationRegion;
     property ServiceURL: string read GetServiceURL write SetServiceURL;
@@ -135,10 +185,24 @@ type
     property MaxErrorRetry: Integer read GetMaxErrorRetry write SetMaxErrorRetry;
     property IsMaxErrorRetrySet: Boolean read GetIsMaxErrorRetrySet;
     property BufferSize: Integer read GetBufferSize write FBufferSize;
-    property SignatureVersion: string read GetSignatureVersion write FSignatureVersion;
+    property SignatureVersion: string read GetSignatureVersion write SetSignatureVersion;
     property SignatureMethod: TSigningAlgorithm read GetSignatureMethod write FSignatureMethod;
     property UseAlternateUserAgentHeader: Boolean read GetUseAlternateUserAgentHeader write FUseAlternateUserAgentHeader;
     property UserAgent: string read GetUserAgent;
+    property AllowAutoRedirect: Boolean read GetAllowAutoRedirect write FAllowAutoRedirect;
+
+    /// <summary>
+    /// Returns the flag indicating the current mode in use for request
+    /// retries and influences the value returned from <see cref="MaxErrorRetry"/>.
+    /// The default value is RequestRetryMode.Legacy. This flag can be configured
+    /// by using the AWS_RETRY_MODE environment variable, retry_mode in the
+    /// shared configuration file, or by setting this value directly.
+    /// </summary>
+    property RetryMode: TRequestRetryMode read GetRetryMode write SetRetryMode;
+
+    property FastFailRequests: Boolean read GetFastFailRequests write FFastFailRequests;
+
+    property ThrottleRetries: Boolean read GetThrottleRetries write FThrottleRetries;
   end;
 
 implementation
@@ -156,6 +220,22 @@ begin
   Init;
 end;
 
+function TClientConfig.ClockOffset: TTimeSpan;
+begin
+  if TAWSConfigs.ManualClockCorrection.HasValue then
+    Result := TAWSConfigs.ManualClockCorrection.Value
+  else
+  begin
+    var endpoint := DetermineServiceURL;
+    Result := TCorrectClockSkew.GetClockCorrectionForEndpoint(endpoint);
+  end;
+end;
+
+function TClientConfig.CorrectedUtcNow: TDateTime;
+begin
+  Result := TCorrectClockSkew.GetCorrectedUtcNowForEndpoint(DetermineServiceURL);
+end;
+
 constructor TClientConfig.Create(ARegion: IRegionEndpointEx);
 begin
   Create;
@@ -168,6 +248,16 @@ begin
     Result := ServiceURL
   else
     Result := GetUrl(RegionEndpoint, RegionEndpointServiceName, UseHttp, UseDualstackEndpoint);
+end;
+
+function TClientConfig.GetFastFailRequests: Boolean;
+begin
+  Result := FFastFailRequests;
+end;
+
+function TClientConfig.GetAllowAutoRedirect: Boolean;
+begin
+  Result := FAllowAutoRedirect;
 end;
 
 function TClientConfig.GetAuthenticationRegion: string;
@@ -214,12 +304,20 @@ function TClientConfig.GetMaxErrorRetry: Integer;
 begin
   if not FMaxRetries.HasValue then
   begin
-    {TODO: Implement this}
-//    if RetryMode = TRequestRetryMode.Legacy then
-//      Exit(MaxRetriesLegacyDefault);
+    //For legacy mode there was no MaxAttempts shared config or
+    //environment variables so use the legacy default value.
+    if RetryMode = TRequestRetryMode.Legacy then
+      Exit(MaxRetriesLegacyDefault);
 
-
-
+    //For standard and adaptive modes first check the environment variables
+    //and shared config for a value. Otherwise default to the new default value.
+    //In the shared config or environment variable MaxAttempts is the total number
+    //of attempts. This will include the initial call and must be deducted from
+    //from the number of actual retries.
+    if TFallbackInternalConfigurationFactory.MaxAttempts.HasValue then
+      Exit(TFallbackInternalConfigurationFactory.MaxAttempts.Value - 1)
+     else
+      Exit(MaxRetriesDefault);
   end;
   Result := FMaxRetries.Value;
 end;
@@ -244,6 +342,19 @@ begin
   Result := FResignRetries;
 end;
 
+function TClientConfig.GetRetryMode: TRequestRetryMode;
+begin
+  if not FRetryMode.HasValue then
+  begin
+    if TFallbackInternalConfigurationFactory.RetryMode.HasValue then
+      Exit(TFallbackInternalConfigurationFactory.RetryMode.Value)
+    else
+      Exit(TRequestRetryMode.Legacy);
+  end;
+
+  Result := FRetryMode.Value;
+end;
+
 function TClientConfig.GetServiceURL: string;
 begin
   Result := FServiceURL;
@@ -257,6 +368,11 @@ end;
 function TClientConfig.GetSignatureVersion: string;
 begin
   Result := FSignatureVersion;
+end;
+
+function TClientConfig.GetThrottleRetries: Boolean;
+begin
+  Result := FThrottleRetries;
 end;
 
 class function TClientConfig.GetUrl(ARegionEndpoint: IRegionEndpointEx; const ARegionEndpointServiceName: string;
@@ -292,6 +408,7 @@ begin
   FSignatureVersion := '4';
   FSignatureMethod := TSigningAlgorithm.HmacSHA256;
   FBufferSize := TAWSSDKUtils.DefaultBufferSize;
+  FAllowAutoRedirect := True;
 end;
 
 procedure TClientConfig.SetMaxErrorRetry(const Value: Integer);
@@ -306,11 +423,21 @@ begin
   FProbeForRegionEndpoint := FRegionEndpoint = nil;
 end;
 
+procedure TClientConfig.SetRetryMode(const Value: TRequestRetryMode);
+begin
+  FRetryMode := Value;
+end;
+
 procedure TClientConfig.SetServiceURL(const Value: string);
 begin
   FRegionEndpoint := nil;
   FProbeForRegionEndpoint := False;
   FServiceUrl := Value;
+end;
+
+procedure TClientConfig.SetSignatureVersion(const Value: string);
+begin
+  FSignatureVersion := Value;
 end;
 
 procedure TClientConfig.Validate;

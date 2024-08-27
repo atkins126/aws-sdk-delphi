@@ -44,8 +44,9 @@ uses
   AWS.Polly.Transform.SynthesizeSpeechRequestMarshaller,
   AWS.Internal.Request,
   AWS.Runtime.Model,
-  Sparkle.Uri,
+  AWS.Lib.Uri,
   AWS.Auth.Signer,
+  AWS.Internal.Auth.AWS4SignerHelper,
   AWS.Runtime.Client;
 
 { TSynthesizeSpeechUtil }
@@ -101,9 +102,13 @@ begin
   // Create presigned URL and assign it
   SigningResult := TAWS4PreSignedUrlSigner.SignRequest(Request, nil,
     ImmutableCredentials.AccessKey, ImmutableCredentials.SecretKey, PollyServiceName, ARegion.SystemName);
+  try
 
-  {TODO: Review use of AbsoluteUri, ComposeUrl returnign IUri instead of string}
-  Result := TAmazonServiceClient.ComposeUrl(Request) + '&' + SigningResult.ForQueryParameters;
+    {TODO: Review use of AbsoluteUri, ComposeUrl returnign IUri instead of string}
+    Result := TAmazonServiceClient.ComposeUrl(Request) + '&' + SigningResult.ForQueryParameters;
+  finally
+    SigningResult.Free;
+  end;
 end;
 
 end.

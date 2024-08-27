@@ -4,15 +4,19 @@ interface
 
 uses
   System.Classes, System.SysUtils,
-  AWS.SDKUtils;
+  AWS.Lib.Utils,
+  AWS.Enums;
 
 type
   ICryptoUtil = interface
+    function HashAsString(const AData: TArray<Byte>; AsUpperCase: Boolean = False): string;
     function ComputeSHA256Hash(const AData: TArray<Byte>): TArray<Byte>; overload;
     function ComputeSHA256Hash(AStream: TStream): TArray<Byte>; overload;
-    function ComputeMD5Hash(const AData: TArray<Byte>): TArray<Byte>;
+    function ComputeMD5Hash(const AData: TArray<Byte>): TArray<Byte>; overload;
+    function ComputeMD5Hash(Input: TStream): TArray<Byte>; overload;
     function HMACSignBinary(const AData, AKey: TArray<Byte>; AAlgorithmName: TSigningAlgorithm): TArray<Byte>;
-    function HashAsString(const AData: TArray<Byte>): string;
+    function HMACSign(const AData, AKey: string; AAlgorithmName: TSigningAlgorithm): string; overload;
+    function HMACSign(const AData: TArray<Byte>; const AKey: string; AAlgorithmName: TSigningAlgorithm): string; overload;
   end;
 
   TCryptoUtilFactory = class
@@ -25,11 +29,14 @@ type
 
   TCryptoUtil = class(TInterfacedObject, ICryptoUtil)
   public
-    function HashAsString(const AData: TArray<Byte>): string;
+    function HashAsString(const AData: TArray<Byte>; AsUpperCase: Boolean = False): string;
     function ComputeSHA256Hash(const AData: TArray<Byte>): TArray<Byte>; overload;
     function ComputeSHA256Hash(AStream: TStream): TArray<Byte>; overload;
     function ComputeMD5Hash(const AData: TArray<Byte>): TArray<Byte>; overload;
+    function ComputeMD5Hash(Input: TStream): TArray<Byte>; overload;
     function HMACSignBinary(const AData, AKey: TArray<Byte>; AAlgorithmName: TSigningAlgorithm): TArray<Byte>;
+    function HMACSign(const AData, AKey: string; AAlgorithmName: TSigningAlgorithm): string; overload;
+    function HMACSign(const AData: TArray<Byte>; const AKey: string; AAlgorithmName: TSigningAlgorithm): string; overload;
   end;
 
 implementation
@@ -70,14 +77,46 @@ begin
   Result := Hash.HashAsBytes;
 end;
 
+function TCryptoUtil.ComputeMD5Hash(Input: TStream): TArray<Byte>;
+begin
+  Result := THashMD5.GetHashBytes(Input);
+end;
+
 function TCryptoUtil.ComputeSHA256Hash(AStream: TStream): TArray<Byte>;
 begin
   Result := THashSHA2.GetHashBytes(AStream, SHA256);
 end;
 
-function TCryptoUtil.HashAsString(const AData: TArray<Byte>): string;
+function TCryptoUtil.HashAsString(const AData: TArray<Byte>; AsUpperCase: Boolean = False): string;
 begin
   Result := THash.DigestAsString(AData);
+  if AsUpperCase then
+    Result := UpperCase(Result);
+end;
+
+function TCryptoUtil.HMACSign(const AData, AKey: string; AAlgorithmName: TSigningAlgorithm): string;
+begin
+  var binaryData := TEncoding.UTF8.GetBytes(AData);
+  Result := HMACSign(binaryData, AKey, AAlgorithmName);
+end;
+
+function TCryptoUtil.HMACSign(const AData: TArray<Byte>; const AKey: string; AAlgorithmName: TSigningAlgorithm): string;
+begin
+  if AKey = '' then
+    raise EArgumentNilException.Create('Please specify a Secret Signing Key.');
+  if Length(AData) = 0 then
+    raise EArgumentNilException.Create('Please specify data to sign.');
+
+  var bytes: TArray<Byte>;
+  case AAlgorithmName of
+    TSigningAlgorithm.HmacSHA1:
+      bytes := THashSHA1.GetHMACAsBytes(AData, TEncoding.UTF8.GetBytes(AKey));
+    TSigningAlgorithm.HmacSHA256:
+      bytes := THashSHA2.GetHMACAsBytes(AData, TEncoding.UTF8.GetBytes(AKey), SHA256);
+  else
+    raise EInvalidDataException.Create('Unsupported signing algorithm');
+  end;
+  Result := AWS.Lib.Utils.EncodeBase64(bytes);
 end;
 
 function TCryptoUtil.HMACSignBinary(const AData, AKey: TArray<Byte>; AAlgorithmName: TSigningAlgorithm): TArray<Byte>;
@@ -95,7 +134,6 @@ begin
   else
     raise EInvalidDataException.Create('Unsupported signing algorithm');
   end;
-
 end;
 
 end.

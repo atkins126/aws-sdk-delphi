@@ -3,9 +3,22 @@ unit AWS.SNS.Message;
 interface
 
 uses
-  System.SysUtils, System.StrUtils, System.Generics.Collections, System.Classes,
-  Bcl.Types.Nullable,
-  AWS.OpenSSL;
+  System.SysUtils, System.StrUtils, System.Generics.Collections, System.Classes, System.Math, System.RegularExpressions,
+  System.JSON,
+{$IFDEF USE_SPARKLE}
+  Sparkle.Http.Client,
+  {$IFDEF MSWINDOWS}
+  Sparkle.WinHttp.Engine,
+  {$ENDIF}
+{$ELSE}
+  System.Net.HttpClient,
+{$ENDIF}
+  AWS.Lib.Uri,
+  AWS.Lib.Utils,
+  AWS.Nullable,
+  AWS.OpenSSL,
+  AWS.Runtime.Exceptions,
+  AWS.SDKUtils;
 
 type
   TMessage = class
@@ -70,21 +83,9 @@ type
     property TopicArn: string read FTopicArn write FTopicArn;
     property MessageType: string read FType write FType;
     property UnsubscribeUrl: string read FUnsubscribeURL write FUnsubscribeURL;
-
   end;
 
 implementation
-
-uses
-  System.Math,
-  Bcl.Json.Classes,
-  Bcl.Json,
-  Bcl.Utils,
-  Sparkle.Http.Client,
-  Sparkle.Uri,
-  RegularExpressions,
-  AWS.Runtime.Exceptions,
-  AWS.Runtime.HttpRequestMessageFactory;
 
 { TMessage }
 
@@ -185,14 +186,13 @@ begin
   if FTimestampString = '' then
     Result := Default(TDateTime)
   else
-    Result := TBclUtils.ISOToDateTime(FTimestampString, TTimeZoneMode.AsLocal);
+    Result := AWS.Lib.Utils.ISOToDateTime(FTimestampString);
 end;
 
 function TMessage.GetX509Certificate: TOpenSSLX509;
 var
   Retries: Integer;
   Client: THttpClient;
-  Response: THttpResponse;
 begin
   TMonitor.Enter(FCertificateCache);
   try
@@ -202,9 +202,13 @@ begin
     begin
       for Retries := 1 to MAX_RETRIES do
         try
-          Client := THttpRequestMessageFactory.CreateHttpClient(nil);
+{$IFDEF USE_SPARKLE}
+          Client := THttpClient.Create;
           try
-            Response := Client.Get(SigningCertURL);
+  {$IFDEF MSWINDOWS}
+            TWinHttpEngine(Client.Engine).ProxyMode := THttpProxyMode.Auto;
+  {$ENDIF}
+            var Response: THttpResponse := Client.Get(SigningCertURL);
             try
               Result := TOpenSSLX509.LoadFromBytes(Response.ContentAsBytes);
               FCertificateCache.Add(SigningCertURL, Result);
@@ -215,6 +219,17 @@ begin
           finally
             Client.Free;
           end;
+{$ELSE}
+          Client := THttpClient.Create;
+          try
+            var Response := Client.Execute(Client.GetRequest('GET', SigningCertURL));
+            Result := TOpenSSLX509.LoadFromBytes(TAWSSDKUtils.StreamToBytes(Response.ContentStream));
+            FCertificateCache.Add(SigningCertURL, Result);
+            Exit;
+          finally
+            Client.Free;
+          end;
+{$ENDIF}
         except
           on E: Exception do
           begin
@@ -244,7 +259,7 @@ begin
   Verifier := Certificate.PublicKey.InitDigestVerifier(TOpenSSLDigestType.SHA1);
   try
     Verifier.Update(BytesToSign);
-    Result := Verifier.Verify(TBclUtils.DecodeBase64(Signature));
+    Result := Verifier.Verify(AWS.Lib.Utils.DecodeBase64(Signature));
   finally
     Verifier.Free;
   end;
@@ -268,22 +283,22 @@ end;
 class function TMessage.ParseMessage(const AMessageText: string): TMessage;
 var
   Msg: TMessage;
-  JsonData: TJObject;
+  JsonData: TJSONObject;
 
   function ExtractField(const FieldName: string): Nullable<string>;
   var
-    Member: TJMember;
+    Member: TJSONPair;
   begin
     for Member in JsonData do
-      if SameText(Member.Name, FieldName) and Member.Value.IsString then
-        Exit(Member.Value.AsString);
+      if SameText(Member.JsonString.Value, FieldName) and (Member.JsonValue is TJSONString) then
+        Exit(TJSONString(Member.JsonValue).Value);
     Result := SNull;
   end;
 
 begin
   Msg := TMessage.Create;
   try
-    JsonData := TJson.Deserialize<TJObject>(AMessageText);
+    JsonData := TJSONObject.ParseJSONValue(AMessageText) as TJSONObject;
     try
       Msg.FMessageId := ExtractField('MessageId').ValueOrDefault;
       Msg.FMessageText := ExtractField('Message').ValueOrDefault;
